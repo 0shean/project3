@@ -14,7 +14,7 @@ from configuration import Configuration
 from configuration import CONSTANTS as C
 from data import AMASSBatch
 from data import LMDBDataset
-from data_transforms import ToTensor
+from data_transforms import ToTensor, DCTTransform
 from fk import SMPLForwardKinematics
 from models import create_model
 from torch.utils.data import DataLoader
@@ -99,10 +99,7 @@ def evaluate_test(model_id, viz=False):
 
     # No need to extract windows for the test set, since it only contains the seed sequence anyway.
     from data_transforms import DCTTransform
-    test_transform = transforms.Compose([
-        DCTTransform(num_coeffs=config.dct_n),
-        ToTensor()
-    ])
+    test_transform = transforms.Compose([DCTTransform(num_coeffs=model_config.dct_n), ToTensor()])
 
     test_data = LMDBDataset(os.path.join(C.DATA_DIR, "test"), transform=test_transform)
     test_loader = DataLoader(test_data,
