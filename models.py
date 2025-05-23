@@ -84,7 +84,7 @@ class MotionAttentionModel(nn.Module):
 
         # Predictor
         A = get_adjacency_matrix(self.num_joints)
-        self.gcn1 = GCNLayer(in_channels=2 * self.hidden_dim, out_channels=self.hidden_dim, A=A)
+        self.gcn1 = GCNLayer(in_channels=4608, out_channels=hidden_dim, A=A)
         self.gcn2 = GCNLayer(in_channels=self.hidden_dim, out_channels=self.num_future * self.joint_dim, A=A)
 
     def forward(self, batch):
@@ -119,10 +119,8 @@ class MotionAttentionModel(nn.Module):
         # Concatenate query and attended context: [B, 135, 2H]
         features = torch.cat([Q, context], dim=-1)  # [B, 135, 2H]
         features = features.view(B, self.num_joints, self.joint_dim, -1)  # [B, 15, 9, 2H]
-        features = features.reshape(B, self.num_joints, -1)  # [B, 15, 9 * 2H]
+        features = features.reshape(B, self.num_joints, -1)  # [B, 15, 4608]
 
-        features = features.view(B, self.num_joints,
-                                 self.joint_dim * 2 * self.hidden_dim // self.joint_dim)  # [B, 15, 2H]
 
         x = self.gcn1(features)  # [B, 15, H]
         x = F.relu(x)
