@@ -12,28 +12,24 @@ class DCTTransform:
         self.num_coeffs = num_coeffs  # number of DCT coeffs to retain
 
     def __call__(self, sample):
-        # sample.poses: [T, 15, 3, 3]
-        poses = sample.poses  # shape: (T, J, 3, 3)
-        T, J = poses.shape[:2]
+        poses = sample.poses  # [T, 135] most likely
+        T = poses.shape[0]
 
-        # Flatten rotation matrices to (T, J, 9)
-        # Check if poses are flattened, reshape to [T, J, 3, 3]
         if poses.ndim == 2 and poses.shape[1] == 135:
-            poses = poses.reshape(T, J, 3, 3)
+            poses = poses.reshape(T, 15, 9).reshape(T, 15, 3, 3)  # 💥 FIX HERE
 
-        poses_flat = poses.reshape(T, J, 9)
+        poses_flat = poses.reshape(T, 15, 9)
 
-        # Apply DCT along time axis for each joint/dimension
-        dct_coeffs = np.zeros((J, 9, self.num_coeffs), dtype=np.float32)  # [15, 9, K]
-        for j in range(J):
+        dct_coeffs = np.zeros((15, 9, self.num_coeffs), dtype=np.float32)
+        for j in range(15):
             for d in range(9):
-                joint_signal = poses_flat[:, j, d]  # shape: (T,)
-                coeffs = dct(joint_signal, norm='ortho')  # shape: (T,)
+                joint_signal = poses_flat[:, j, d]
+                coeffs = dct(joint_signal, norm='ortho')
                 dct_coeffs[j, d] = coeffs[:self.num_coeffs]
 
-        # Save into sample
-        sample.dct_input = dct_coeffs  # shape: [15, 9, K]
+        sample.dct_input = dct_coeffs
         return sample
+
 
 class ToTensor(object):
     """Convert numpy arrays inside samples to PyTorch tensors."""
