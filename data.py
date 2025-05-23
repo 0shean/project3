@@ -62,11 +62,11 @@ class AMASSBatch(object):
         # Add DCT fields
         batch.dct_input = torch.tensor(
             np.stack([sample.dct_input for sample in sample_list]), dtype=torch.float32
-        )
+        ).to(device=C.DEVICE)
 
         batch.dct_history = torch.tensor(
             np.stack([sample.dct_history for sample in sample_list]), dtype=torch.float32
-        )
+        ).to(device=C.DEVICE)
 
         return batch
 
