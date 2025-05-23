@@ -53,7 +53,8 @@ def get_adjacency_matrix(num_joints):
 
 class MotionAttentionModel(nn.Module):
 
-
+    def model_name(self):
+        return f"MotionAttentionModel-dct{self.dct_n}"
     def __init__(self, num_joints=15, joint_dim=9, dct_n=20, hidden_dim=256, num_future_frames=24):
         super().__init__()
         self.num_joints = num_joints
