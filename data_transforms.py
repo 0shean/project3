@@ -17,7 +17,11 @@ class DCTTransform:
         T, J = poses.shape[:2]
 
         # Flatten rotation matrices to (T, J, 9)
-        poses_flat = poses.reshape(T, J, 9)  # [T, 15, 9]
+        # Check if poses are flattened, reshape to [T, J, 3, 3]
+        if poses.ndim == 2 and poses.shape[1] == 135:
+            poses = poses.reshape(T, J, 3, 3)
+
+        poses_flat = poses.reshape(T, J, 9)
 
         # Apply DCT along time axis for each joint/dimension
         dct_coeffs = np.zeros((J, 9, self.num_coeffs), dtype=np.float32)  # [15, 9, K]
