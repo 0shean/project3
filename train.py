@@ -95,13 +95,13 @@ def main(config):
     # Training: extract windows, apply DCT, then convert to tensor
     train_transform = transforms.Compose([
         ExtractWindow(window_size, rng_extractor, mode='random'),
-        DCTTransform(num_coeffs=20),  # 👈 new DCT transform
+        DCTTransform(num_coeffs=config.dct_n),  # 👈 new DCT transform
         ToTensor()
     ])
 
     # Validation: extract windows, apply DCT, then convert to tensor
     valid_transform = transforms.Compose([
-        DCTTransform(num_coeffs=20),  # 👈 also apply to validation for consistency
+        DCTTransform(num_coeffs=config.dct_n),  # 👈 also apply to validation for consistency
         ToTensor()
     ])
 
@@ -109,7 +109,11 @@ def main(config):
     # `window_size` are rejected.
     train_data = LMDBDataset(os.path.join(C.DATA_DIR, "training"), transform=train_transform,
                              filter_seq_len=window_size)
-    valid_data = LMDBDataset(os.path.join(C.DATA_DIR, "validation"), transform=valid_transform)
+
+    valid_data = LMDBDataset(os.path.join(C.DATA_DIR, "validation"), transform=train_transform,
+                             filter_seq_len=window_size)
+
+    train_data = train_data + valid_data  # Combine
 
     train_loader = DataLoader(train_data,
                               batch_size=config.bs_train,

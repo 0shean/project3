@@ -18,9 +18,44 @@ from scipy.fftpack import idct
 def create_model(config):
     # This is a helper function that can be useful if you have several model definitions that you want to
     # choose from via the command line. For now, we just return the Dummy model.
-    return DummyModel(config)
+    if config.model.name == "motion_attention":
+        return MotionAttentionModel(
+            num_joints=15, joint_dim=9, dct_n=config.dct_n, hidden_dim=256, num_future_frames=config.target_seq_len
+        )
+    else:
+        return DummyModel(config)
+
+
+class GCNLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, A):
+        super().__init__()
+        self.A = torch.tensor(A, dtype=torch.float32, requires_grad=False)  # [J, J]
+        self.fc = nn.Linear(in_channels, out_channels)
+
+    def forward(self, x):
+        # x: [B, J, C]
+        x = torch.einsum('ij,bjc->bic', self.A, x)  # graph propagation
+        x = self.fc(x)
+        return x
+
+def get_adjacency_matrix(num_joints):
+    A = np.eye(num_joints)
+    bone_connections = [
+        (0, 1), (1, 2), (2, 3),  # spine to head
+        (1, 4), (4, 5),  # right arm
+        (1, 6), (6, 7),  # left arm
+        (0, 8), (8, 9), (9, 10),  # right leg
+        (0, 11), (11, 12), (12, 13)  # left leg
+    ]
+    for i, j in bone_connections:
+        A[i, j] = 1
+        A[j, i] = 1
+    return A
+
 
 class MotionAttentionModel(nn.Module):
+
+
     def __init__(self, num_joints=15, joint_dim=9, dct_n=20, hidden_dim=256, num_future_frames=24):
         super().__init__()
         self.num_joints = num_joints
@@ -48,44 +83,66 @@ class MotionAttentionModel(nn.Module):
         )
 
         # Predictor
-        self.predictor = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_future_frames * joint_dim)
-        )
+        A = get_adjacency_matrix(self.num_joints)
+        self.gcn1 = GCNLayer(in_channels=2 * self.hidden_dim, out_channels=self.hidden_dim, A=A)
+        self.gcn2 = GCNLayer(in_channels=self.hidden_dim, out_channels=self.num_future * self.joint_dim, A=A)
 
     def forward(self, batch):
-        x = batch.dct_input  # shape: [B, 15, 9, 20]
+        """
+        batch.dct_input: [B, 15, 9, 40]
+        batch.dct_history: [B, N, 15, 9, 40]
+        """
+        x = batch.dct_input  # [B, 15, 9, 40]
+        h = batch.dct_history  # [B, N, 15, 9, 40]
+
         B, J, D, K = x.shape
+        N = h.shape[1]
 
-        x = x.view(B, J * D, K)  # [B, 135, 20]
+        # Flatten joints and axes: [B, 135, 40]
+        x_flat = x.view(B, J * D, K)  # query: [B, 135, 40]
+        h_flat = h.view(B, N, J * D, K)  # history: [B, N, 135, 40]
 
-        Q = self.query_net(x)  # [B, 135, H]
-        K_ = self.key_net(x)   # [B, 135, H]
-        V = self.value_net(x)  # [B, 135, H]
+        # Encode query: [B, 135, H]
+        Q = self.query_net(x_flat)  # [B, 135, H]
 
-        attn_weights = torch.bmm(Q, K_.transpose(1, 2)) / (Q.shape[-1] ** 0.5)
-        attn = torch.softmax(attn_weights, dim=-1)
-        context = torch.bmm(attn, V)
+        # Encode history as keys and values
+        K_enc = self.key_net(h_flat)  # [B, N, 135, H]
+        V_enc = self.value_net(h_flat)  # [B, N, 135, H]
 
-        features = torch.cat([Q, context], dim=-1)  # [B, 135, 2H]
-        out = self.predictor(features)  # [B, 135, 24*9]
-        out = out.view(B, self.num_joints, self.joint_dim, self.num_future).permute(0, 3, 1, 2)  # [B, 24, 15, 9]
+        # Compute attention scores: [B, 135, N]
+        scores = torch.einsum('bij, bnij -> bin', Q, K_enc) / (Q.shape[-1] ** 0.5)
+        attn_weights = torch.softmax(scores, dim=-1)  # [B, 135, N]
 
-        # Inverse DCT and reshape to [B, 24, 15, 3, 3]
+        # Aggregate over values: weighted sum → [B, 135, H]
+        context = torch.einsum('bin, bnij -> bij', attn_weights, V_enc)
+
+        # Concatenate query and attended context: [B, 135, 2H]
+        features = torch.cat([Q, context], dim=-1)
+
+        features = features.view(B, self.num_joints,
+                                 self.joint_dim * 2 * self.hidden_dim // self.joint_dim)  # [B, 15, 2H]
+
+        x = self.gcn1(features)  # [B, 15, H]
+        x = F.relu(x)
+        x = self.gcn2(x)  # [B, 15, 24*9]
+
+        # Predict future DCT: [B, 135, 24*9]
+        out = self.predictor(features)  # [B, 135, 216]
+        out = x.view(B, self.num_joints, self.num_future, self.joint_dim).permute(0, 2, 1, 3)  # [B, 24, 15, 9]
+
+        # Inverse DCT
         output_np = out.detach().cpu().numpy()
         reconstructed = np.zeros((B, self.num_future, self.num_joints, 3, 3), dtype=np.float32)
 
         for b in range(B):
             for j in range(self.num_joints):
                 for d in range(self.joint_dim):
-                    signal = output_np[b, :, j, d]  # (24,)
+                    signal = output_np[b, :, j, d]
                     time_series = idct(signal, n=self.num_future, norm='ortho')
                     output_np[b, :, j, d] = time_series
                 for t in range(self.num_future):
                     reconstructed[b, t, j] = output_np[b, t, j].reshape(3, 3)
 
-        # Return output in expected format
         pred = torch.tensor(reconstructed, dtype=torch.float32, device=x.device)  # [B, 24, 15, 3, 3]
         return {'predictions': pred}
 

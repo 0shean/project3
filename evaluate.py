@@ -100,7 +100,7 @@ def evaluate_test(model_id, viz=False):
     # No need to extract windows for the test set, since it only contains the seed sequence anyway.
     from data_transforms import DCTTransform
     test_transform = transforms.Compose([
-        DCTTransform(num_coeffs=20),
+        DCTTransform(num_coeffs=config.dct_n),
         ToTensor()
     ])
 
