@@ -18,12 +18,10 @@ from scipy.fftpack import idct
 def create_model(config):
     # This is a helper function that can be useful if you have several model definitions that you want to
     # choose from via the command line. For now, we just return the Dummy model.
-    if config.model.name == "motion_attention":
-        return MotionAttentionModel(
-            num_joints=15, joint_dim=9, dct_n=config.dct_n, hidden_dim=256, num_future_frames=config.target_seq_len
-        )
-    else:
-        return DummyModel(config)
+    return MotionAttentionModel(
+        num_joints=15, joint_dim=9, dct_n=config.dct_n, hidden_dim=256, num_future_frames=config.target_seq_len
+    )
+
 
 
 class GCNLayer(nn.Module):
