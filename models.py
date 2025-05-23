@@ -127,8 +127,6 @@ class MotionAttentionModel(nn.Module):
         x = F.relu(x)
         x = self.gcn2(x)  # [B, 15, 24*9]
 
-        # Predict future DCT: [B, 135, 24*9]
-        out = self.predictor(features)  # [B, 135, 216]
         out = x.view(B, self.num_joints, self.num_future, self.joint_dim).permute(0, 2, 1, 3)  # [B, 24, 15, 9]
 
         # Inverse DCT
