@@ -32,7 +32,8 @@ class GCNLayer(nn.Module):
 
     def forward(self, x):
         # x: [B, J, C]
-        x = torch.einsum('ij,bjc->bic', self.A, x)  # graph propagation
+        A = self.A.to(x.device)  # move to same device as input
+        x = torch.einsum('ij,bjc->bic', A, x)
         x = self.fc(x)
         return x
 
