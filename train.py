@@ -199,7 +199,11 @@ def main(config):
                 print('[TRAIN {:0>5d} | {:0>3d}] {} elapsed: {:.3f} secs'.format(
                     i + 1, epoch + 1, loss_string, elapsed))
                 me.reset()
-                me.compute_and_aggregate(model_out['predictions'], targets)
+                # Flatten predictions from [B, 24, 15, 3, 3] → [B, 24, 15, 9]
+                pred_flat = model_out['predictions'].reshape(model_out['predictions'].shape[:3] + (9,))
+                targets_flat = targets.reshape(targets.shape[:3] + (9,))
+                me.compute_and_aggregate(pred_flat, targets_flat)
+
                 me.to_tensorboard_log(me.get_final_metrics(), writer, global_step, 'train')
 
             if global_step % (config.eval_every - 1) == 0:
