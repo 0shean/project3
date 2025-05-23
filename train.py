@@ -71,7 +71,14 @@ def _evaluate(net, data_loader, metrics_engine):
                 loss_vals_agg[k] += loss_vals[k] * batch_gpu.batch_size
 
             # Compute metrics.
-            metrics_engine.compute_and_aggregate(model_out['predictions'], targets)
+            pred = model_out['predictions']
+            pred_flat = pred.view(pred.shape[0], pred.shape[1], -1)
+
+            t = targets
+            t_flat = t.view(t.shape[0], t.shape[1], -1)
+
+            # Compute metrics on flattened vectors
+            metrics_engine.compute_and_aggregate(pred_flat, t_flat)
 
             n_samples += batch_gpu.batch_size
 
