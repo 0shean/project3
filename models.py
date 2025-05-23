@@ -150,7 +150,8 @@ class MotionAttentionModel(nn.Module):
         Compute the loss between model_out['predictions'] and ground-truth in batch.
         """
         pred = model_out['predictions']  # [B, 24, 15, 3, 3]
-        gt = batch.poses[:, -self.num_future:]  # [B, 24, 15, 3, 3]
+        gt = batch.poses[:, -self.num_future:].reshape(-1, self.num_future, 15, 3, 3)
+
 
         # Compute per-frame MSE
         loss = F.mse_loss(pred, gt, reduction='mean')
