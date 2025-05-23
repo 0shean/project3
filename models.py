@@ -19,14 +19,14 @@ def create_model(config):
 
 
 class TimeEmbedding(nn.Module):
-    def __init__(self, num_heads, emb_dim=64, max_windows=500):
+    def __init__(self, max_windows, emb_dim, d_model):
         super().__init__()
-        self.emb = nn.Embedding(max_windows, emb_dim)
-        self.proj = nn.Linear(emb_dim, num_heads)
-
+        self.emb  = nn.Embedding(max_windows, emb_dim)
+        self.proj = nn.Linear(emb_dim, d_model)    # now 64→256
     def forward(self, idxs):
-        h = self.emb(idxs)  # [B, N, emb_dim]
-        return self.proj(h)  # [B, N, num_heads]
+        h = self.emb(idxs)      # [B,N,64]
+        return self.proj(h)     # [B,N,256]
+
 
 
 class GCNLayer(nn.Module):
@@ -84,7 +84,11 @@ class MotionAttentionModel(nn.Module):
         )
 
         # Time embeddings for memory windows
-        self.time_emb = TimeEmbedding(self.num_heads, emb_dim=64)
+        self.time_emb = TimeEmbedding(
+            max_windows=500,  # or however many windows you support
+            emb_dim=64,
+            d_model=self.d_model  # 256 in your case
+        )
 
         # Graph convolutional predictor
         A = get_adjacency_matrix(self.num_joints)
@@ -108,11 +112,13 @@ class MotionAttentionModel(nn.Module):
         hp = self.input_proj(h_flat)    # [B, N, 135, d_model]
 
         # Time bias
-        idxs = torch.arange(N, device=x.device).unsqueeze(0).repeat(B, 1)  # [B, N]
-        tb = self.time_emb(idxs)                                           # [B, N, num_heads]
-        tb = tb.view(B*N, self.num_heads)
-        tb = self.input_proj(tb).view(B, N, 1, self.d_model)
-        hp = hp + tb  # add to history embeddings
+        # 1) build window indices
+        idxs = torch.arange(N, device=x.device).unsqueeze(0).repeat(B, 1)  # [B,N]
+
+        # 2) get a [B, N, d_model] time bias and broadcast to each joint×axis
+        tb = self.time_emb(idxs)  # [B,N,256]
+        tb = tb.unsqueeze(2)  # [B,N,1,256]
+        hp = hp + tb  # broadcast adds to [B,N,135,256]
 
         # Reshape history for attention
         h_seq = hp.view(B, N * J * D, self.d_model)  # [B, N*135, d_model]
