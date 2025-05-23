@@ -1,50 +1,54 @@
-"""
-Neural networks for motion prediction.
-
-Copyright ETH Zurich, Manuel Kaufmann
-"""
-import torch
-import torch.nn as nn
-
-from data import AMASSBatch
-from losses import mse
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from scipy.fftpack import idct
 
+from data import AMASSBatch
+from losses import mse
+
+
 def create_model(config):
-    # This is a helper function that can be useful if you have several model definitions that you want to
-    # choose from via the command line. For now, we just return the Dummy model.
     return MotionAttentionModel(
-        num_joints=15, joint_dim=9, dct_n=config.dct_n, hidden_dim=256, num_future_frames=config.target_seq_len
+        num_joints=15,
+        joint_dim=9,
+        dct_n=config.dct_n,
+        hidden_dim=config.hidden_dim if hasattr(config, 'hidden_dim') else 256,
+        num_future_frames=config.target_seq_len
     )
 
+
+class TimeEmbedding(nn.Module):
+    def __init__(self, num_heads, emb_dim=64, max_windows=500):
+        super().__init__()
+        self.emb = nn.Embedding(max_windows, emb_dim)
+        self.proj = nn.Linear(emb_dim, num_heads)
+
+    def forward(self, idxs):
+        h = self.emb(idxs)  # [B, N, emb_dim]
+        return self.proj(h)  # [B, N, num_heads]
 
 
 class GCNLayer(nn.Module):
     def __init__(self, in_channels, out_channels, A):
         super().__init__()
-        self.A = torch.tensor(A, dtype=torch.float32, requires_grad=False)  # [J, J]
+        self.A = torch.tensor(A, dtype=torch.float32, requires_grad=False)
         self.fc = nn.Linear(in_channels, out_channels)
 
     def forward(self, x):
-        # x: [B, J, C]
-        A = self.A.to(x.device)  # move to same device as input
+        A = self.A.to(x.device)
         x = torch.einsum('ij,bjc->bic', A, x)
-        x = self.fc(x)
-        return x
+        return self.fc(x)
+
 
 def get_adjacency_matrix(num_joints):
     A = np.eye(num_joints)
     bone_connections = [
-        (0, 1), (1, 2), (2, 3),  # spine to head
-        (1, 4), (4, 5),  # right arm
-        (1, 6), (6, 7),  # left arm
-        (0, 8), (8, 9), (9, 10),  # right leg
-        (0, 11), (11, 12), (12, 13)  # left leg
+        (0, 1), (1, 2), (2, 3),
+        (1, 4), (4, 5),
+        (1, 6), (6, 7),
+        (0, 8), (8, 9), (9, 10),
+        (0, 11), (11, 12), (12, 13)
     ]
     for i, j in bone_connections:
         A[i, j] = 1
@@ -53,110 +57,102 @@ def get_adjacency_matrix(num_joints):
 
 
 class MotionAttentionModel(nn.Module):
-
     def model_name(self):
-        return f"MotionAttentionModel-dct{self.dct_n}"
-    def __init__(self, num_joints=15, joint_dim=9, dct_n=20, hidden_dim=256, num_future_frames=24):
+        return f"MotionAttentionModel-dct{self.dct_n}-mh{self.num_heads}"
+
+    def __init__(
+        self, num_joints=15, joint_dim=9, dct_n=20,
+        hidden_dim=256, num_future_frames=24
+    ):
         super().__init__()
         self.num_joints = num_joints
         self.joint_dim = joint_dim
         self.dct_n = dct_n
         self.num_future = num_future_frames
         self.hidden_dim = hidden_dim
+        self.num_heads = 8
+        self.d_model = hidden_dim
 
-        # Embedding networks for keys, queries, and values
-        self.query_net = nn.Sequential(
-            nn.Linear(dct_n, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+        # Project DCT inputs to model dimension
+        self.input_proj = nn.Linear(self.dct_n, self.d_model)
+
+        # Multi-head attention
+        self.mha = nn.MultiheadAttention(
+            embed_dim=self.d_model,
+            num_heads=self.num_heads,
+            batch_first=True
         )
 
-        self.key_net = nn.Sequential(
-            nn.Linear(dct_n, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+        # Time embeddings for memory windows
+        self.time_emb = TimeEmbedding(self.num_heads, emb_dim=64)
 
-        self.value_net = nn.Sequential(
-            nn.Linear(dct_n, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-
-        # Predictor
+        # Graph convolutional predictor
         A = get_adjacency_matrix(self.num_joints)
-        self.gcn1 = GCNLayer(in_channels=4608, out_channels=hidden_dim, A=A)
+        in_ch = self.joint_dim * 2 * self.d_model
+        self.gcn1 = GCNLayer(in_channels=in_ch, out_channels=self.hidden_dim, A=A)
         self.gcn2 = GCNLayer(in_channels=self.hidden_dim, out_channels=self.num_future * self.joint_dim, A=A)
 
     def forward(self, batch):
-        """
-        batch.dct_input: [B, 15, 9, 40]
-        batch.dct_history: [B, N, 15, 9, 40]
-        """
-        x = batch.dct_input  # [B, 15, 9, 40]
-        h = batch.dct_history  # [B, N, 15, 9, 40]
+        x = batch.dct_input  # [B, J, D, K]
+        h = batch.dct_history  # [B, N, J, D, K]
 
         B, J, D, K = x.shape
         N = h.shape[1]
 
-        # Flatten joints and axes: [B, 135, 40]
-        x_flat = x.view(B, J * D, K)  # query: [B, 135, 40]
-        h_flat = h.view(B, N, J * D, K)  # history: [B, N, 135, 40]
+        # Flatten to sequences
+        x_flat = x.view(B, J*D, K)      # [B, 135, dct_n]
+        h_flat = h.view(B, N, J*D, K)   # [B, N, 135, dct_n]
 
-        # Encode query: [B, 135, H]
-        Q = self.query_net(x_flat)  # [B, 135, H]
+        # Project
+        q = self.input_proj(x_flat)     # [B, 135, d_model]
+        hp = self.input_proj(h_flat)    # [B, N, 135, d_model]
 
-        # Encode history as keys and values
-        K_enc = self.key_net(h_flat)  # [B, N, 135, H]
-        V_enc = self.value_net(h_flat)  # [B, N, 135, H]
+        # Time bias
+        idxs = torch.arange(N, device=x.device).unsqueeze(0).repeat(B, 1)  # [B, N]
+        tb = self.time_emb(idxs)                                           # [B, N, num_heads]
+        tb = tb.view(B*N, self.num_heads)
+        tb = self.input_proj(tb).view(B, N, 1, self.d_model)
+        hp = hp + tb  # add to history embeddings
 
-        # Compute attention scores: [B, 135, N]
-        scores = torch.einsum('bij, bnij -> bin', Q, K_enc) / (Q.shape[-1] ** 0.5)
-        attn_weights = torch.softmax(scores, dim=-1)  # [B, 135, N]
+        # Reshape history for attention
+        h_seq = hp.view(B, N * J * D, self.d_model)  # [B, N*135, d_model]
 
-        # Aggregate over values: weighted sum → [B, 135, H]
-        context = torch.einsum('bin, bnij -> bij', attn_weights, V_enc)
+        # Attention
+        attn_out, _ = self.mha(query=q, key=h_seq, value=h_seq)  # [B, 135, d_model]
 
-        # Concatenate query and attended context: [B, 135, 2H]
-        features = torch.cat([Q, context], dim=-1)  # [B, 135, 2H]
-        features = features.view(B, self.num_joints, self.joint_dim, -1)  # [B, 15, 9, 2H]
-        features = features.reshape(B, self.num_joints, -1)  # [B, 15, 4608]
+        # Combine
+        features = torch.cat([q, attn_out], dim=-1)  # [B, 135, 2*d_model]
+        features = features.view(B, J, D, 2*self.d_model)
+        features = features.reshape(B, J, -1)  # [B, J, joint_dim*2*d_model]
 
-
-        x = self.gcn1(features)  # [B, 15, H]
+        # GCN prediction
+        x = self.gcn1(features)
         x = F.relu(x)
-        x = self.gcn2(x)  # [B, 15, 24*9]
+        x = self.gcn2(x)
 
-        out = x.view(B, self.num_joints, self.num_future, self.joint_dim).permute(0, 2, 1, 3)  # [B, 24, 15, 9]
+        # Reshape to DCT coefficients
+        out = x.view(B, J, self.num_future, self.joint_dim).permute(0, 2, 1, 3)  # [B, T, J, 9]
 
-        # Inverse DCT
-        output_np = out.detach().cpu().numpy()
-        reconstructed = np.zeros((B, self.num_future, self.num_joints, 3, 3), dtype=np.float32)
-
+        # Inverse DCT to rotation matrices
+        out_np = out.detach().cpu().numpy()
+        rec = np.zeros((B, self.num_future, self.num_joints, 3, 3), dtype=np.float32)
         for b in range(B):
             for j in range(self.num_joints):
                 for d in range(self.joint_dim):
-                    signal = output_np[b, :, j, d]
-                    time_series = idct(signal, n=self.num_future, norm='ortho')
-                    output_np[b, :, j, d] = time_series
-                for t in range(self.num_future):
-                    reconstructed[b, t, j] = output_np[b, t, j].reshape(3, 3)
+                    coeffs = out_np[b, :, j, d]
+                    ts = idct(coeffs, n=self.num_future, norm='ortho')
+                    out_np[b, :, j, d] = ts
+                rec[b, :, j] = out_np[b, :, j].reshape(self.num_future, 3, 3)
 
-        pred = torch.tensor(reconstructed, dtype=torch.float32, device=x.device)  # [B, 24, 15, 3, 3]
+        pred = torch.tensor(rec, dtype=torch.float32, device=x.device)
         return {'predictions': pred}
 
     def backward(self, batch, model_out):
-        """
-        Compute the loss between model_out['predictions'] and ground-truth in batch.
-        """
-        pred = model_out['predictions']  # [B, 24, 15, 3, 3]
-        gt = batch.poses[:, -self.num_future:].reshape(-1, self.num_future, 15, 3, 3)
-
-
-        # Compute per-frame MSE
+        pred = model_out['predictions']
+        gt = batch.poses[:, -self.num_future:].reshape(-1, self.num_future, self.num_joints, 3, 3)
         loss = F.mse_loss(pred, gt, reduction='mean')
-
         return {'total_loss': loss}, gt
+
 
 
 class BaseModel(nn.Module):
