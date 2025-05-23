@@ -200,8 +200,9 @@ def main(config):
                     i + 1, epoch + 1, loss_string, elapsed))
                 me.reset()
                 # Flatten predictions from [B, 24, 15, 3, 3] → [B, 24, 15, 9]
-                pred_flat = model_out['predictions'].reshape(model_out['predictions'].shape[:3] + (9,))
-                targets_flat = targets.reshape(targets.shape[:3] + (9,))
+                pred_flat = model_out['predictions'].reshape(model_out['predictions'].shape[0],
+                                                             model_out['predictions'].shape[1], -1)
+                targets_flat = targets.reshape(targets.shape[0], targets.shape[1], -1)
                 me.compute_and_aggregate(pred_flat, targets_flat)
 
                 me.to_tensorboard_log(me.get_final_metrics(), writer, global_step, 'train')
