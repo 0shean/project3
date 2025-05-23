@@ -54,11 +54,12 @@ class AMASSBatch(object):
     def from_sample_list(sample_list):
         # existing code that stacks sample.poses, etc.
 
-        batch = AMASSBatch()
-        batch.poses = torch.stack([sample.poses for sample in sample_list])
-        batch.seq_ids = [sample.seq_id for sample in sample_list]
+        poses = torch.stack([sample.poses for sample in sample_list])
+        seq_ids = [sample.seq_id for sample in sample_list]
 
-        # Add this:
+        batch = AMASSBatch(seq_ids=seq_ids, poses=poses)
+
+        # Add DCT fields
         batch.dct_input = torch.tensor(
             np.stack([sample.dct_input for sample in sample_list]), dtype=torch.float32
         )
