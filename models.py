@@ -60,6 +60,7 @@ class MotionAttentionModel(nn.Module):
         self.joint_dim = joint_dim
         self.dct_n = dct_n
         self.num_future = num_future_frames
+        self.hidden_dim = hidden_dim
 
         # Embedding networks for keys, queries, and values
         self.query_net = nn.Sequential(
