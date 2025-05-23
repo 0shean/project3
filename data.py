@@ -62,11 +62,11 @@ class AMASSBatch(object):
         # Add DCT fields
         batch.dct_input = torch.tensor(
             np.stack([sample.dct_input for sample in sample_list]), dtype=torch.float32
-        ).to(device=C.DEVICE)
+        )
 
         batch.dct_history = torch.tensor(
             np.stack([sample.dct_history for sample in sample_list]), dtype=torch.float32
-        ).to(device=C.DEVICE)
+        )
 
         return batch
 
@@ -80,8 +80,9 @@ class AMASSBatch(object):
         return self.poses.shape[1]
 
     def to_gpu(self):
-        """Move data to GPU."""
-        self.poses = self.poses.to(device=C.DEVICE)
+        self.poses = self.poses.to(C.DEVICE)
+        self.dct_input = self.dct_input.to(C.DEVICE)
+        self.dct_history = self.dct_history.to(C.DEVICE)
         return self
 
 
