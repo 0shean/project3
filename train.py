@@ -27,7 +27,7 @@ def _log_loss_vals(loss_vals, writer, global_step, mode_prefix):
         writer.add_scalar(prefix, v, global_step)
 
 
-def _evaluate(net, data_loader, metrics_engine):
+def _evaluate(net, data_loader, metrics_engine, config):
     """
     Evaluate model on validation loader: compute average loss and metrics.
     """
@@ -40,10 +40,10 @@ def _evaluate(net, data_loader, metrics_engine):
         for abatch in data_loader:
             batch_gpu = abatch.to_gpu()
             # extract seed sequence
-            seq = batch_gpu.poses[:, :net.seed_len, :]
+            seq = batch_gpu.poses[:, :config.seed_seq_len, :]
             predictions = net(seq)
             # ground-truth future frames
-            targets = batch_gpu.poses[:, net.seed_len:]
+            targets = batch_gpu.poses[:, config.seed_seq_len:, :]
             # compute loss
             loss = mse(predictions, targets)
             loss_sum += loss.item() * batch_gpu.batch_size
@@ -144,7 +144,7 @@ def main(config):
 
             if global_step % config.eval_every == 0:
                 # validation
-                valid_losses = _evaluate(net, valid_loader, me)
+                valid_losses = _evaluate(net, valid_loader, me, config)
                 valid_metrics = me.get_final_metrics()
                 print(f'[VALID] total_loss: {valid_losses["total_loss"]:.6f}')
                 _log_loss_vals(valid_losses, writer, global_step, 'valid')
