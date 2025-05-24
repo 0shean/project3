@@ -88,8 +88,9 @@ def main(config):
     # instantiate model
     net = MotionAttentionSPLModel(config).to(C.DEVICE)
     print(f"Training on device: {C.DEVICE}")
-    print(f"  Example param on device: {next(net.parameters()).device}")
-    print(f'Model created with {U.count_parameters(net)} parameters')
+    print("CUDA available:", torch.cuda.is_available())
+    print("Using device:", C.DEVICE)
+    print("Example param device:", next(net.parameters()).device)
 
     # metrics engine
     me = MetricsEngine(C.METRIC_TARGET_LENGTHS)
