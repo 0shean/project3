@@ -60,28 +60,34 @@ class BaseModel(nn.Module):
 
         pred_seq = torch.stack(outputs, dim=1)
 
-        return {
-            'predictions': pred_seq,
-            'target': target_seq,
-        }
+        if self.training:
+            return {
+                'predictions': pred_seq,
+                'target': target_seq
+            }
+        else:
+            return {
+                'predictions': pred_seq,
+                'seed': input_seq[:, -1:]  # shape (B, 1, 135)
+            }
 
-    def backward(self, batch, model_out):
+    def backward(self, batch, model_out, do_backward=True):
         pred_seq = model_out['predictions']
         target_seq = model_out['target']
 
-        # keep gradients
         loss_mpjpe = mpjpe(pred_seq, target_seq)
         loss_angle = angle_loss(pred_seq, target_seq)
         total_loss = loss_mpjpe + loss_angle
 
-        # safe to detach here
+        if do_backward:
+            total_loss.backward()
+
         loss_dict = {
             'mpjpe': loss_mpjpe.item(),
             'angle_loss': loss_angle.item(),
             'total_loss': total_loss.item(),
         }
 
-        total_loss.backward()
         return loss_dict, target_seq
 
     def model_name(self):

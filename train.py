@@ -61,7 +61,8 @@ def _evaluate(net, data_loader, metrics_engine):
             model_out = net(batch_gpu)
 
             # Compute the loss.
-            loss_vals, targets = net.backward(batch_gpu, model_out)
+            loss_vals, targets = net.backward(batch_gpu, model_out, do_backward=False)
+
 
             # Accumulate the loss and multiply with the batch size (because the last batch might have different size).
             for k in loss_vals:
