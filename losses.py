@@ -17,15 +17,11 @@ def mse(predictions, targets):
     return loss_per_sample_and_seq.mean()
 
 def mpjpe(predict, target):
-    return torch.mean(torch.norm(predict - target, dim=-1))
+    return torch.mean(torch.norm(predict - target, dim=-1))  # must return a torch.Tensor
 
 def angle_loss(predict, target):
-    return torch.mean(torch.acos(
-        torch.clamp(
-            ((predict * target).sum(dim=-1)) /
-            (predict.norm(dim=-1) * target.norm(dim=-1) + 1e-8),
-            -1.0, 1.0
-        )
-    ))
+    cos_sim = (predict * target).sum(dim=-1) / (
+        predict.norm(dim=-1) * target.norm(dim=-1) + 1e-8)
+    return torch.mean(torch.acos(torch.clamp(cos_sim, -1.0, 1.0)))
 
 

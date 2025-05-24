@@ -69,10 +69,12 @@ class BaseModel(nn.Module):
         pred_seq = model_out['predictions']
         target_seq = model_out['target']
 
+        # keep gradients
         loss_mpjpe = mpjpe(pred_seq, target_seq)
         loss_angle = angle_loss(pred_seq, target_seq)
         total_loss = loss_mpjpe + loss_angle
 
+        # safe to detach here
         loss_dict = {
             'mpjpe': loss_mpjpe.item(),
             'angle_loss': loss_angle.item(),
@@ -80,9 +82,7 @@ class BaseModel(nn.Module):
         }
 
         total_loss.backward()
-
         return loss_dict, target_seq
-
 
     def model_name(self):
         """A summary string of this model. Override this if desired."""
