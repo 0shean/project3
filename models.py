@@ -12,6 +12,7 @@ from losses import mse
 from losses import mpjpe, angle_loss
 from data import AMASSBatch
 from losses import mpjpe, angle_loss
+from fk import SMPL_MAJOR_JOINTS, SMPL_JOINTS
 
 def create_model(config):
     # This is a helper function that can be useful if you have several model definitions that you want to
@@ -60,8 +61,7 @@ class BaseModel(nn.Module):
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.ReLU())
         #assume config.joint_names is a list of your 15 SMPL joints
-        joint_names = config.joint_names
-        # each joint has pose_size / len(joint_names) dims (e.g. 9)
+        joint_names = [SMPL_JOINTS[i] for i in SMPL_MAJOR_JOINTS]
         joint_dim = self.input_size // len(joint_names)
         self.spl = StructuredPredictionLayer(in_dim = self.hidden_size, joint_dim = joint_dim, joint_names = joint_names)
 
