@@ -120,6 +120,9 @@ def main(config):
     # Create the model.
     net = create_model(config)
     net.to(C.DEVICE)
+    print(f"Training on device: {C.DEVICE}")
+    print("CUDA available:", torch.cuda.is_available())
+    print("Using device:", C.DEVICE)
     print('Model created with {} trainable parameters'.format(U.count_parameters(net)))
 
     # Prepare metrics engine.
