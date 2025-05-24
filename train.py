@@ -169,7 +169,7 @@ def main(config):
 
     # Define the optimizer.
     optimizer = torch.optim.AdamW(net.parameters(), lr = config.lr, weight_decay = config.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
 
     # Training loop.
     global_step = 0
