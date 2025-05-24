@@ -1,138 +1,149 @@
+"""
+Neural networks for motion prediction.
+
+Copyright ETH Zurich, Manuel Kaufmann
+"""
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from utils import dct, idct
+from data import AMASSBatch
+from losses import mse
+from losses import mpjpe, angle_loss
 
 
-class MotionAttentionEncoder(nn.Module):
-    """
-    Splits the input sequence into overlapping windows, encodes via DCT,
-    and applies self-attention between a query (recent window) and past windows.
-    """
+def create_model(config):
+    # This is a helper function that can be useful if you have several model definitions that you want to
+    # choose from via the command line. For now, we just return the Dummy model.
+    return BaseModel(config)
 
-    def __init__(self, seq_len, window_size, stride, dct_size, embed_dim, num_heads, dropout=0.1):
+
+class BaseModel(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.seq_len = seq_len
-        self.window_size = window_size
-        self.stride = stride
-        self.dct_size = dct_size
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
+        self.input_size = config.input_dim        # e.g., 135
+        self.hidden_size = config.hidden_size     # e.g., 512
+        self.num_layers = config.num_layers       # e.g., 2
+        self.pred_frames = config.output_n        # e.g., 24
 
-        # Linear projections for Q, K, V
-        dim_C = dct_size * embed_dim
-        self.lin_q = nn.Linear(dim_C, embed_dim)
-        self.lin_k = nn.Linear(dim_C, embed_dim)
-        self.lin_v = nn.Linear(dim_C, embed_dim)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        # GRU for autoregressive modeling
+        self.gru = nn.GRU(
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            batch_first=True
+        )
 
-    def forward(self, x):
-        # x: (B, T, D) where T = seq_len, D = embed_dim
-        B, T, D = x.size()
-        # 1) split into windows
-        windows = [x[:, i:i + self.window_size, :] for i in range(0, T - self.window_size + 1, self.stride)]
-        w = len(windows)
-        assert w >= 2, "Need at least one past and one query window"
-        # 2) DCT encode each window along time dim
-        coeffs = []
-        for win in windows:
-            wperm = win.permute(0, 2, 1)  # (B, D, W)
-            d = dct(wperm, norm='ortho')  # (B, D, W)
-            dsub = d[:, :, :self.dct_size]  # (B, D, dct_size)
-            coeffs.append(dsub.reshape(B, -1))  # (B, dct_size*D)
-        # stack: (w, B, C)
-        coeffs = torch.stack(coeffs, dim=0)
-        past, query = coeffs[:-1], coeffs[-1]
-        # project
-        Q = self.lin_q(query)  # (B, E)
-        K = self.lin_k(past)  # (w-1, B, E)
-        V = self.lin_v(past)  # (w-1, B, E)
-        # reshape for attention: (L, N, E)
-        Q = Q.unsqueeze(0)  # (1, B, E)
-        attn_out, _ = self.attn(Q, K, V)
-        attn_out = attn_out.squeeze(0)  # (B, E)
-        return self.out_proj(attn_out)
+        # MLP head for predicting deltas (residuals)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.input_size)
+        )
+
+    def forward(self, batch):
+        seq = batch.seqs
+        input_seq = seq[:, :120]
+        target_seq = seq[:, 120:]
+
+        B, T_in, D = input_seq.shape
+        h = None
+        x_t = input_seq[:, -1]
+        outputs = []
+
+        for _ in range(self.pred_frames):
+            x_t_input = x_t.unsqueeze(1)
+            out, h = self.gru(x_t_input, h)
+            delta = self.mlp(out.squeeze(1))
+            x_t = x_t + delta
+            outputs.append(x_t)
+
+        pred_seq = torch.stack(outputs, dim=1)
+
+        return {
+            'predictions': pred_seq,
+            'target': target_seq,
+        }
+
+    def backward(self, batch, model_out):
+        pred_seq = model_out['predictions']
+        target_seq = model_out['target']
+
+        loss_mpjpe = mpjpe(pred_seq, target_seq)
+        loss_angle = angle_loss(pred_seq, target_seq)
+        total_loss = loss_mpjpe + loss_angle
+
+        loss_dict = {
+            'mpjpe': loss_mpjpe.item(),
+            'angle_loss': loss_angle.item(),
+            'total_loss': total_loss.item(),
+        }
+
+        total_loss.backward()
+
+        return loss_dict, target_seq
+
+    # noinspection PyAttributeOutsideInit
+    def create_model(self):
+        """Create the model, called automatically by the initializer."""
+        raise NotImplementedError("Must be implemented by subclass.")
+
+    def backward(self, batch: AMASSBatch, model_out):
+        """The backward pass."""
+        raise NotImplementedError("Must be implemented by subclass.")
+
+    def model_name(self):
+        """A summary string of this model. Override this if desired."""
+        return '{}-lr{}'.format(self.__class__.__name__, self.config.lr)
 
 
-class StructuredPredictionLayer(nn.Module):
+class DummyModel(BaseModel):
     """
-    Predicts joint rotations sequentially along the kinematic tree.
-    """
-
-    def __init__(self, feature_dim, joint_dim, parent_indices, hidden_size, share_weights=False):
-        super().__init__()
-        self.joint_dim = joint_dim
-        self.parent_indices = parent_indices
-        self.num_joints = len(parent_indices)
-        self.share_weights = share_weights
-        if share_weights:
-            self.shared_mlp = nn.Sequential(
-                nn.Linear(feature_dim + joint_dim, hidden_size),
-                nn.ReLU(),
-                nn.Linear(hidden_size, joint_dim)
-            )
-        else:
-            self.mlps = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(feature_dim + joint_dim, hidden_size),
-                    nn.ReLU(),
-                    nn.Linear(hidden_size, joint_dim)
-                ) for _ in range(self.num_joints)
-            ])
-
-    def forward(self, features):
-        B = features.size(0)
-        device = features.device
-        preds = [None] * self.num_joints
-        for i, parent in enumerate(self.parent_indices):
-            parent_rot = torch.zeros(B, self.joint_dim, device=device) if parent < 0 else preds[parent]
-            inp = torch.cat([features, parent_rot], dim=-1)
-            out = self.shared_mlp(inp) if self.share_weights else self.mlps[i](inp)
-            preds[i] = out
-        return torch.cat(preds, dim=-1)
-
-
-class MotionAttentionSPLModel(nn.Module):
-    """
-    Embeds input sequence, applies motion-attention,
-    and predicts future frames via SPL.
+    This is a dummy model. It provides basic implementations to demonstrate how more advanced models can be built.
     """
 
     def __init__(self, config):
-        super().__init__()
-        in_dim = config.input_dim
-        seq_len = config.seed_seq_len
-        self.future_len = config.target_seq_len
-        emb_dim = config.model_embed_dim
-        self.frame_embed = nn.Linear(in_dim, emb_dim)
-        self.attn = MotionAttentionEncoder(
-            seq_len=seq_len,
-            window_size=config.ma_window_size,
-            stride=config.ma_stride,
-            dct_size=config.ma_dct_size,
-            embed_dim=emb_dim,
-            num_heads=config.ma_num_heads,
-            dropout=config.ma_dropout
-        )
-        self.gru = nn.GRU(emb_dim, emb_dim, batch_first=True) if config.model_use_gru else None
-        feat_dim = emb_dim * (1 + (1 if self.gru else 0))
-        self.spl = StructuredPredictionLayer(
-            feature_dim=feat_dim,
-            joint_dim=config.joint_dim,
-            parent_indices=config.parent_indices,
-            hidden_size=config.spl_hidden_size,
-            share_weights=config.spl_share_weights
-        )
+        self.n_history = 10
+        super(DummyModel, self).__init__(config)
 
-    def forward(self, seq):
-        x = self.frame_embed(seq)  # (B, seq_len, emb_dim)
-        attn_feat = self.attn(x)  # (B, emb_dim)
-        feats = [attn_feat]
-        if self.gru:
-            _, h = self.gru(x[:, -self.gru.input_size:], None)
-            feats.append(h.squeeze(0))
-        feat = torch.cat(feats, dim=-1)  # (B, feat_dim)
-        pred_frame = self.spl(feat)  # (B, num_joints*joint_dim)
-        return pred_frame.unsqueeze(1).repeat(1, self.future_len, 1)
+    # noinspection PyAttributeOutsideInit
+    def create_model(self):
+        # In this model we simply feed the last time steps of the seed to a dense layer and
+        # predict the targets directly.
+        self.dense = nn.Linear(in_features=self.n_history * self.pose_size,
+                               out_features=self.config.target_seq_len * self.pose_size)
+
+    def forward(self, batch: AMASSBatch):
+        """
+        The forward pass.
+        :param batch: Current batch of data.
+        :return: Each forward pass must return a dictionary with keys {'seed', 'predictions'}.
+        """
+        model_out = {'seed': batch.poses[:, :self.config.seed_seq_len],
+                     'predictions': None}
+        batch_size = batch.batch_size
+        model_in = batch.poses[:, self.config.seed_seq_len-self.n_history:self.config.seed_seq_len]
+        pred = self.dense(model_in.reshape(batch_size, -1))
+        model_out['predictions'] = pred.reshape(batch_size, self.config.target_seq_len, -1)
+        return model_out
+
+    def backward(self, batch: AMASSBatch, model_out):
+        """
+        The backward pass.
+        :param batch: The same batch of data that was passed into the forward pass.
+        :param model_out: Whatever the forward pass returned.
+        :return: The loss values for book-keeping, as well as the targets for convenience.
+        """
+        predictions = model_out['predictions']
+        targets = batch.poses[:, self.config.seed_seq_len:]
+
+        total_loss = mse(predictions, targets)
+
+        # If you have more than just one loss, just add them to this dict and they will automatically be logged.
+        loss_vals = {'total_loss': total_loss.cpu().item()}
+
+        if self.training:
+            # We only want to do backpropagation in training mode, as this function might also be called when evaluating
+            # the model on the validation set.
+            total_loss.backward()
+
+        return loss_vals, targets

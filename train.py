@@ -1,3 +1,8 @@
+"""
+The training script.
+
+Copyright ETH Zurich, Manuel Kaufmann
+"""
 import collections
 import glob
 import numpy as np
@@ -10,66 +15,86 @@ import utils as U
 
 from configuration import Configuration
 from configuration import CONSTANTS as C
-from data import AMASSBatch, LMDBDataset
-from data_transforms import ExtractWindow, ToTensor
+from data import AMASSBatch
+from data import LMDBDataset
+from data_transforms import ExtractWindow
+from data_transforms import ToTensor
 from evaluate import evaluate_test
+from models import create_model
 from motion_metrics import MetricsEngine
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 from torchvision.transforms import transforms
-from models import MotionAttentionSPLModel
-from losses import mse
+
+from models import BaseModel
 
 
 def _log_loss_vals(loss_vals, writer, global_step, mode_prefix):
-    for k, v in loss_vals.items():
-        prefix = f'{k}/{mode_prefix}'
-        writer.add_scalar(prefix, v, global_step)
+    for k in loss_vals:
+        prefix = '{}/{}'.format(k, mode_prefix)
+        writer.add_scalar(prefix, loss_vals[k], global_step)
 
 
-def _evaluate(net, data_loader, metrics_engine, config):
+def _evaluate(net, data_loader, metrics_engine):
     """
-    Evaluate model on validation loader: compute average loss and metrics.
+    Evaluate a model on the given dataset. This computes the loss, but does not do any backpropagation or gradient
+    update.
+    :param net: The model to evaluate.
+    :param data_loader: The dataset.
+    :param metrics_engine: MetricsEngine to compute metrics.
+    :return: The loss value.
     """
+    # Put the model in evaluation mode.
     net.eval()
-    loss_sum = 0.0
+
+    # Some book-keeping.
+    loss_vals_agg = collections.defaultdict(float)
     n_samples = 0
     metrics_engine.reset()
 
     with torch.no_grad():
         for abatch in data_loader:
+            # Move data to GPU.
             batch_gpu = abatch.to_gpu()
-            # extract seed sequence
-            seq = batch_gpu.poses[:, :config.seed_seq_len, :]
-            predictions = net(seq)
-            # ground-truth future frames
-            targets = batch_gpu.poses[:, config.seed_seq_len:, :]
-            # compute loss
-            loss = mse(predictions, targets)
-            loss_sum += loss.item() * batch_gpu.batch_size
-            # aggregate metrics
-            metrics_engine.compute_and_aggregate(predictions, targets)
+
+            # Get the predictions.
+            model_out = net(batch_gpu)
+
+            # Compute the loss.
+            loss_vals, targets = net.backward(batch_gpu, model_out)
+
+            # Accumulate the loss and multiply with the batch size (because the last batch might have different size).
+            for k in loss_vals:
+                loss_vals_agg[k] += loss_vals[k] * batch_gpu.batch_size
+
+            # Compute metrics.
+            metrics_engine.compute_and_aggregate(model_out['predictions'], targets)
+
             n_samples += batch_gpu.batch_size
 
-    avg_loss = loss_sum / n_samples if n_samples > 0 else 0.0
-    return {'total_loss': avg_loss}
+    # Compute the correct average for the entire data set.
+    for k in loss_vals_agg:
+        loss_vals_agg[k] /= n_samples
+
+    return loss_vals_agg
 
 
 def main(config):
-    # set seed
-    if not hasattr(config, 'seed') or config.seed is None:
+    # Fix seed.
+    if config.seed is None:
         config.seed = int(time.time())
 
-    # transforms
+    # Define some transforms that are applied to each `AMASSSample` before they are collected into a batch.
+    # You can define your own transforms in `data_transforms.py` and add them here.
     rng_extractor = np.random.RandomState(4313)
     window_size = config.seed_seq_len + config.target_seq_len
-    train_transform = transforms.Compose([
-        ExtractWindow(window_size, rng_extractor, mode='random'),
-        ToTensor()
-    ])
+    train_transform = transforms.Compose([ExtractWindow(window_size, rng_extractor, mode='random'),
+                                          ToTensor()])
+    # Validation data is already in the correct length, so no need to extract windows.
     valid_transform = transforms.Compose([ToTensor()])
 
-    # datasets and loaders
+    # For the training data we pass in the `window_size` variable, so that all samples whose length is smaller than
+    # `window_size` are rejected.
     train_data = LMDBDataset(os.path.join(C.DATA_DIR, "training"), transform=train_transform,
                              filter_seq_len=window_size)
     valid_data = LMDBDataset(os.path.join(C.DATA_DIR, "validation"), transform=valid_transform)
@@ -85,88 +110,120 @@ def main(config):
                               num_workers=config.data_workers,
                               collate_fn=AMASSBatch.from_sample_list)
 
-    # instantiate model
-    net = MotionAttentionSPLModel(config).to(C.DEVICE)
-    print(f"Training on device: {C.DEVICE}")
-    print("CUDA available:", torch.cuda.is_available())
-    print("Using device:", C.DEVICE)
-    print("Example param device:", next(net.parameters()).device)
+    # Load some data statistics, but they are not used further.
+    # You may use these stats if you want, but you can also compute them yourself.
+    stats = np.load(os.path.join(C.DATA_DIR, "training", "stats.npz"), allow_pickle=True)['stats'].tolist()
 
-    # metrics engine
+    # Set the pose size in the config as models use this later.
+    setattr(config, 'pose_size', 135)
+
+    # Create the model.
+    net = create_model(config)
+    net.to(C.DEVICE)
+    print('Model created with {} trainable parameters'.format(U.count_parameters(net)))
+
+    # Prepare metrics engine.
     me = MetricsEngine(C.METRIC_TARGET_LENGTHS)
+    me.reset()
 
-    # experiment setup
+    # Create or a new experiment ID and a folder where to store logs and config.
     experiment_id = int(time.time())
-    experiment_name = 'motion_attention_spl'
+    experiment_name = net.model_name()
     model_dir = U.create_model_dir(C.EXPERIMENT_DIR, experiment_id, experiment_name)
+
+    # Save code as zip and config as json into the model directory.
     code_files = glob.glob('./*.py', recursive=False)
     U.export_code(code_files, os.path.join(model_dir, 'code.zip'))
     config.to_json(os.path.join(model_dir, 'config.json'))
-    with open(os.path.join(model_dir, 'cmd.txt'), 'w') as f:
-        f.write(sys.argv[0] + ' ' + ' '.join(sys.argv[1:]))
-    checkpoint_file = os.path.join(model_dir, 'model.pth')
-    print(f'Saving checkpoints to {checkpoint_file}')
 
+    # Save the command line that was used.
+    cmd = sys.argv[0] + ' ' + ' '.join(sys.argv[1:])
+    with open(os.path.join(model_dir, 'cmd.txt'), 'w') as f:
+        f.write(cmd)
+
+    # Create a checkpoint file for the best model.
+    checkpoint_file = os.path.join(model_dir, 'model.pth')
+    print('Saving checkpoints to {}'.format(checkpoint_file))
+
+    # Create Tensorboard logger.
     writer = SummaryWriter(os.path.join(model_dir, 'logs'))
+
+    # Define the optimizer.
     optimizer = optim.SGD(net.parameters(), lr=config.lr)
 
-    # training loop
+    # Training loop.
     global_step = 0
     best_valid_loss = float('inf')
     for epoch in range(config.n_epochs):
-        net.train()
+
         for i, abatch in enumerate(train_loader):
             start = time.time()
             optimizer.zero_grad()
 
-            # forward: extract seed tensor and run the model
+            # Move data to GPU.
             batch_gpu = abatch.to_gpu()
-            seq = batch_gpu.poses[:, :config.seed_seq_len, :]  # (B, seed_seq_len, input_dim)
-            predictions = net(seq)
 
-            # compute loss
-            targets = batch_gpu.poses[:, config.seed_seq_len:, :]
-            loss = mse(predictions, targets)
-            loss_val = loss.item()
+            # Get the predictions.
+            model_out = net(batch_gpu)
 
-            # backward
-            loss.backward()
+            # Compute gradients.
+            train_losses, targets = net.backward(batch_gpu, model_out)
+
+            # Update params.
             optimizer.step()
 
-            # logging
             elapsed = time.time() - start
-            loss_vals = {'total_loss': loss_val}
-            _log_loss_vals(loss_vals, writer, global_step, 'train')
+
+            # Write training stats to Tensorboard.
+            _log_loss_vals(train_losses, writer, global_step, 'train')
             writer.add_scalar('lr', config.lr, global_step)
 
-            if global_step % config.print_every == 0:
-                print(f'[TRAIN {i+1:05d} | {epoch+1:03d}] total_loss: {loss_val:.6f} elapsed: {elapsed:.3f}s')
+            if global_step % (config.print_every - 1) == 0:
+                loss_string = ' '.join(['{}: {:.6f}'.format(k, train_losses[k]) for k in train_losses])
+                print('[TRAIN {:0>5d} | {:0>3d}] {} elapsed: {:.3f} secs'.format(
+                    i + 1, epoch + 1, loss_string, elapsed))
                 me.reset()
-                me.compute_and_aggregate(predictions, targets)
+                me.compute_and_aggregate(model_out['predictions'], targets)
                 me.to_tensorboard_log(me.get_final_metrics(), writer, global_step, 'train')
 
-            if global_step % config.eval_every == 0:
-                # validation
-                valid_losses = _evaluate(net, valid_loader, me, config)
+            if global_step % (config.eval_every - 1) == 0:
+                # Evaluate on validation.
+                start = time.time()
+                net.eval()
+                valid_losses = _evaluate(net, valid_loader, me)
                 valid_metrics = me.get_final_metrics()
-                print(f'[VALID] total_loss: {valid_losses["total_loss"]:.6f}')
-                _log_loss_vals(valid_losses, writer, global_step, 'valid')
+                elapsed = time.time() - start
 
-                # checkpoint
+                # Log to console.
+                loss_string = ' '.join(['{}: {:.6f}'.format(k, valid_losses[k]) for k in valid_losses])
+                print('[VALID {:0>5d} | {:0>3d}] {} elapsed: {:.3f} secs'.format(
+                    i + 1, epoch + 1, loss_string, elapsed))
+                print('[VALID {:0>5d} | {:0>3d}] {}'.format(i+1, epoch+1, me.get_summary_string(valid_metrics)))
+
+                # Log to tensorboard.
+                _log_loss_vals(valid_losses, writer, global_step, 'valid')
+                me.to_tensorboard_log(valid_metrics, writer, global_step, 'valid')
+
+                # Save the current model if it's better than what we've seen before.
                 if valid_losses['total_loss'] < best_valid_loss:
                     best_valid_loss = valid_losses['total_loss']
                     torch.save({
+                        'iteration': i,
                         'epoch': epoch,
                         'global_step': global_step,
                         'model_state_dict': net.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'valid_loss': best_valid_loss,
+                        'train_loss': train_losses['total_loss'],
+                        'valid_loss': valid_losses['total_loss'],
                     }, checkpoint_file)
+
+                # Make sure the model is in training mode again.
                 net.train()
 
             global_step += 1
 
-    # final test evaluation
+    # After the training, evaluate the model on the test and generate the result file that can be uploaded to the
+    # submission system. The submission file will be stored in the model directory.
     evaluate_test(experiment_id)
 
 
