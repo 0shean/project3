@@ -168,11 +168,8 @@ def main(config):
     writer = SummaryWriter(os.path.join(model_dir, 'logs'))
 
     # Define the optimizer.
-    optimizer = optim.SGD(net.parameters(), lr = config.lr, weight_decay = config.weight_decay)
-
-    # Simple step‐based LR scheduler.
-    # Every `lr_decay_every` epochs, multiply LR by `lr_decay` (e.g. 0.5 halves it).
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = config.lr_decay_every, gamma = config.lr_decay)
+    optimizer = torch.optim.AdamW(net.parameters(), lr = config.lr, weight_decay = config.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6)
 
     # Training loop.
     global_step = 0
@@ -192,6 +189,7 @@ def main(config):
             # Compute gradients.
             train_losses, targets = net.backward(batch_gpu, model_out)
 
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             # Update params.
             optimizer.step()
 
@@ -199,7 +197,8 @@ def main(config):
 
             # Write training stats to Tensorboard.
             _log_loss_vals(train_losses, writer, global_step, 'train')
-            writer.add_scalar('lr', config.lr, global_step)
+            current_lr = optimizer.param_groups[0]['lr']
+            writer.add_scalar('lr', current_lr, global_step)
 
             if global_step % (config.print_every - 1) == 0:
                 loss_string = ' '.join(['{}: {:.6f}'.format(k, train_losses[k]) for k in train_losses])
@@ -242,7 +241,7 @@ def main(config):
 
                 # Make sure the model is in training mode again.
                 net.train()
-            scheduler.step()
+                scheduler.step(valid_losses['total_loss'])
             global_step += 1
 
     # After the training, evaluate the model on the test and generate the result file that can be uploaded to the
