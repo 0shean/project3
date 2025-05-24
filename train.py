@@ -87,6 +87,8 @@ def main(config):
 
     # instantiate model
     net = MotionAttentionSPLModel(config).to(C.DEVICE)
+    print(f"Training on device: {C.DEVICE}")
+    print(f"  Example param on device: {next(net.parameters()).device}")
     print(f'Model created with {U.count_parameters(net)} parameters')
 
     # metrics engine
