@@ -11,7 +11,7 @@ from data import AMASSBatch
 from losses import mse
 from losses import mpjpe, angle_loss
 from data import AMASSBatch
-from losses import mpjpe, angle_loss
+from losses import mpjpe, angle_loss, geodesic_loss
 from fk import SMPL_MAJOR_JOINTS, SMPL_JOINTS
 
 def create_model(config):
@@ -100,16 +100,21 @@ class BaseModel(nn.Module):
         pred_seq = model_out['predictions']
         target_seq = model_out['target']
 
+        B, T, D = pred_seq.shape
+        J = D // 9  # number of joints (15)
+        pred_mat = pred_seq.view(B, T, J, 3, 3)
+        targ_mat = target_seq.view(B, T, J, 3, 3)
+
         loss_mpjpe = mpjpe(pred_seq, target_seq)
-        loss_angle = angle_loss(pred_seq, target_seq)
-        total_loss = loss_mpjpe + loss_angle
+        loss_geo = geodesic_loss(pred_mat, targ_mat)
+        total_loss = loss_mpjpe + loss_geo
 
         if do_backward:
             total_loss.backward()
 
         loss_dict = {
             'mpjpe': loss_mpjpe.item(),
-            'angle_loss': loss_angle.item(),
+            'geodesic_loss': loss_geo.item(),
             'total_loss': total_loss.item(),
         }
 

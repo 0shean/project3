@@ -24,4 +24,12 @@ def angle_loss(predict, target):
         predict.norm(dim=-1) * target.norm(dim=-1) + 1e-8)
     return torch.mean(torch.acos(torch.clamp(cos_sim, -1.0, 1.0)))
 
+def geodesic_loss(pred_mat, targ_mat, eps=1e-7):
+    # pred_mat, targ_mat: [B, T, J, 3, 3]
+    R_err = pred_mat @ targ_mat.transpose(-1, -2)      # [B, T, J, 3, 3]
+    cos_theta = (R_err[..., 0, 0] + R_err[..., 1, 1] + R_err[..., 2, 2] - 1) / 2
+    cos_theta = cos_theta.clamp(-1 + eps, 1 - eps)
+    theta = torch.acos(cos_theta)
+    return theta.mean()
+
 

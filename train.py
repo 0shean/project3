@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import transforms
 
 from models import BaseModel
-from losses import mpjpe, angle_loss
+from losses import mpjpe, angle_loss, geodesic_loss
 
 
 def _log_loss_vals(loss_vals, writer, global_step, mode_prefix):
@@ -65,15 +65,16 @@ def _evaluate(net, data_loader, metrics_engine):
             pred_seq = model_out['predictions']
             target_seq = batch_gpu.poses[:, 120:]  # ground truth targets
 
-            loss_mpjpe = mpjpe(pred_seq, target_seq)
-            loss_angle = angle_loss(pred_seq, target_seq)
-            total_loss = loss_mpjpe + loss_angle
+            # reshape to [B, T, J, 3, 3] to compute geodesic
+            B, T, D = pred_seq.shape
+            J = D // 9
+            pred_mat = pred_seq.view(B, T, J, 3, 3)
+            targ_mat = target_seq.view(B, T, J, 3, 3)
 
-            loss_vals = {
-                'mpjpe': loss_mpjpe.item(),
-                'angle_loss': loss_angle.item(),
-                'total_loss': total_loss.item()
-            }
+            loss_mpjpe = mpjpe(pred_seq, target_seq)
+            loss_geo = geodesic_loss(pred_mat, targ_mat)
+            total_loss = loss_mpjpe + loss_geo
+            loss_vals = {'mpjpe': loss_mpjpe.item(), 'geodesic_loss': loss_geo.item(), 'total_loss': total_loss.item()}
 
             targets = target_seq
 
@@ -167,7 +168,11 @@ def main(config):
     writer = SummaryWriter(os.path.join(model_dir, 'logs'))
 
     # Define the optimizer.
-    optimizer = optim.SGD(net.parameters(), lr=config.lr)
+    optimizer = optim.SGD(net.parameters(), lr = config.lr, weight_decay = config.weight_decay)
+
+    # Simple step‐based LR scheduler.
+    # Every `lr_decay_every` epochs, multiply LR by `lr_decay` (e.g. 0.5 halves it).
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = config.lr_decay_every, gamma = config.lr_decay)
 
     # Training loop.
     global_step = 0
@@ -237,7 +242,7 @@ def main(config):
 
                 # Make sure the model is in training mode again.
                 net.train()
-
+            scheduler.step()
             global_step += 1
 
     # After the training, evaluate the model on the test and generate the result file that can be uploaded to the

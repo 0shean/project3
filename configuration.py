@@ -79,6 +79,10 @@ class Configuration(object):
         parser.add_argument('--num_layers', type=int, default=2)
         parser.add_argument('--output_n', type=int, default=24)
 
+        parser.add_argument('--weight_decay', type=float, default=0.0, help='L2 penalty on weights.')
+        parser.add_argument('--lr_decay', type=float, default=1.0, help='Multiply LR by this every decay step.')
+        parser.add_argument('--lr_decay_every', type=int, default=100, help='Decay LR every N epochs.')
+
         config = parser.parse_args()
         return Configuration(vars(config))
 
