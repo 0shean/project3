@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import transforms
 
 from models import BaseModel
+from losses import mpjpe, angle_loss
 
 
 def _log_loss_vals(loss_vals, writer, global_step, mode_prefix):
@@ -61,7 +62,20 @@ def _evaluate(net, data_loader, metrics_engine):
             model_out = net(batch_gpu)
 
             # Compute the loss.
-            loss_vals, targets = net.backward(batch_gpu, model_out, do_backward=False)
+            pred_seq = model_out['predictions']
+            target_seq = batch_gpu.poses[:, 120:]  # ground truth targets
+
+            loss_mpjpe = mpjpe(pred_seq, target_seq)
+            loss_angle = angle_loss(pred_seq, target_seq)
+            total_loss = loss_mpjpe + loss_angle
+
+            loss_vals = {
+                'mpjpe': loss_mpjpe.item(),
+                'angle_loss': loss_angle.item(),
+                'total_loss': total_loss.item()
+            }
+
+            targets = target_seq
 
 
             # Accumulate the loss and multiply with the batch size (because the last batch might have different size).
