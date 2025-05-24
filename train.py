@@ -116,12 +116,13 @@ def main(config):
             start = time.time()
             optimizer.zero_grad()
 
-            # forward
+            # forward: extract seed tensor and run the model
             batch_gpu = abatch.to_gpu()
-            predictions = net(batch_gpu)
+            seq = batch_gpu.poses[:, :config.seed_seq_len, :]  # (B, seed_seq_len, input_dim)
+            predictions = net(seq)
 
             # compute loss
-            targets = batch_gpu.poses[:, net.seed_len:]
+            targets = batch_gpu.poses[:, config.seed_seq_len:, :]
             loss = mse(predictions, targets)
             loss_val = loss.item()
 
