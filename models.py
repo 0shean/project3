@@ -20,6 +20,7 @@ def create_model(config):
 class BaseModel(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.input_size = config.input_dim        # e.g., 135
         self.hidden_size = config.hidden_size     # e.g., 512
         self.num_layers = config.num_layers       # e.g., 2
