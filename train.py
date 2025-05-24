@@ -39,7 +39,9 @@ def _evaluate(net, data_loader, metrics_engine):
     with torch.no_grad():
         for abatch in data_loader:
             batch_gpu = abatch.to_gpu()
-            predictions = net(batch_gpu)
+            # extract seed sequence
+            seq = batch_gpu.poses[:, :net.seed_len, :]
+            predictions = net(seq)
             # ground-truth future frames
             targets = batch_gpu.poses[:, net.seed_len:]
             # compute loss
@@ -135,13 +137,12 @@ def main(config):
 
             if global_step % config.print_every == 0:
                 print(f'[TRAIN {i+1:05d} | {epoch+1:03d}] total_loss: {loss_val:.6f} elapsed: {elapsed:.3f}s')
-
+                me.reset()
                 me.compute_and_aggregate(predictions, targets)
                 me.to_tensorboard_log(me.get_final_metrics(), writer, global_step, 'train')
 
             if global_step % config.eval_every == 0:
                 # validation
-                me.reset()
                 valid_losses = _evaluate(net, valid_loader, me)
                 valid_metrics = me.get_final_metrics()
                 print(f'[VALID] total_loss: {valid_losses["total_loss"]:.6f}')
