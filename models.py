@@ -42,9 +42,7 @@ class BaseModel(nn.Module):
         )
 
     def forward(self, batch):
-        print(type(batch))
-        print(dir(batch))
-        seq = batch.seqs
+        seq = batch.poses
         input_seq = seq[:, :120]
         target_seq = seq[:, 120:]
 
@@ -85,14 +83,6 @@ class BaseModel(nn.Module):
 
         return loss_dict, target_seq
 
-    # noinspection PyAttributeOutsideInit
-    def create_model(self):
-        """Create the model, called automatically by the initializer."""
-        raise NotImplementedError("Must be implemented by subclass.")
-
-    def backward(self, batch: AMASSBatch, model_out):
-        """The backward pass."""
-        raise NotImplementedError("Must be implemented by subclass.")
 
     def model_name(self):
         """A summary string of this model. Override this if desired."""
