@@ -57,12 +57,7 @@ class Configuration(object):
     def parse_cmd():
         parser = argparse.ArgumentParser()
 
-        # General.
-        parser.add_argument('--data_workers', type=int, default=4, help='Number of parallel threads for data loading.')
-        parser.add_argument('--print_every', type=int, default=200, help='Print stats to console every so many iters.')
-        parser.add_argument('--eval_every', type=int, default=400, help='Evaluate validation set every so many iters.')
-        parser.add_argument('--tag', default='', help='A custom tag for this experiment.')
-        parser.add_argument('--seed', type=int, default=None, help='Random number generator seed.')
+        # … existing args …
 
         # Data.
         parser.add_argument('--seed_seq_len', type=int, default=120, help='Number of frames for the seed length.')
@@ -73,7 +68,40 @@ class Configuration(object):
         parser.add_argument('--n_epochs', type=int, default=50, help='Number of epochs.')
         parser.add_argument('--bs_train', type=int, default=16, help='Batch size for the training set.')
         parser.add_argument('--bs_eval', type=int, default=16, help='Batch size for valid/test set.')
-        parser.add_argument('--dct_n', type=int, default=40, help='Number of DCT coefficients to keep.')
+
+        # Model (Motion-Attention + SPL) hyper-parameters
+        parser.add_argument('--model_embed_dim', type=int, default=512,
+                            help='Dimensionality of frame embeddings and attention output.')
+        parser.add_argument('--model_use_gru', action='store_true',
+                            help='If set, include a local GRU branch alongside motion-attention.')
+        # Motion-Attention
+        parser.add_argument('--ma_window_size', type=int, default=30,
+                            help='DCT window length (in frames).')
+        parser.add_argument('--ma_stride', type=int, default=15,
+                            help='Hop size between DCT windows.')
+        parser.add_argument('--ma_dct_size', type=int, default=20,
+                            help='Number of DCT coefficients to keep per window.')
+        parser.add_argument('--ma_num_heads', type=int, default=8,
+                            help='Number of attention heads in motion-attention.')
+        parser.add_argument('--ma_dropout', type=float, default=0.1,
+                            help='Dropout in motion-attention module.')
+        # Structured Prediction Layer
+        parser.add_argument('--spl_hidden_size', type=int, default=256,
+                            help='Hidden units in each per-joint MLP.')
+        parser.add_argument('--spl_share_weights', action='store_true',
+                            help='If set, all joints share the same MLP in SPL.')
+
+        # Data‐specific constants that never change at runtime can live in Constants,
+        # but if you prefer CLI control you can also expose them here:
+        parser.add_argument('--input_dim', type=int, default=135,
+                            help='Input dimensionality (n_joints * joint_dim).')
+        parser.add_argument('--joint_dim', type=int, default=9,
+                            help='Dimensionality of each joint rotation (e.g., 3×3 matrix flattened).')
+        parser.add_argument('--parent_indices', nargs='+', type=int,
+                            default=[-1, 0, 1, 2, 3, 1, 5, 6, 1, 8, 9, 1, 11, 12, 1],
+                            help='SMPL kinematic tree')
+        # parent indices is awkward to pass by CLI; better to hard-code in a Constants or JSON:
+        #   parent_indices = [-1, 0, 1, 2, 3, 1, 5, …]
 
         config = parser.parse_args()
         return Configuration(vars(config))

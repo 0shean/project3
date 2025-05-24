@@ -14,9 +14,9 @@ from configuration import Configuration
 from configuration import CONSTANTS as C
 from data import AMASSBatch
 from data import LMDBDataset
-from data_transforms import ToTensor, DCTTransform
+from data_transforms import ToTensor
 from fk import SMPLForwardKinematics
-from models import create_model
+from models import MotionAttentionSPLModel
 from torch.utils.data import DataLoader
 from torchvision.transforms import transforms
 from visualize import Visualizer
@@ -76,8 +76,7 @@ def get_model_config(model_id):
 
 def load_model(model_id):
     model_config, model_dir = get_model_config(model_id)
-    net = create_model(model_config)
-
+    net = MotionAttentionSPLModel(model_config)
     net.to(C.DEVICE)
     print('Model created with {} trainable parameters'.format(U.count_parameters(net)))
 
@@ -98,9 +97,7 @@ def evaluate_test(model_id, viz=False):
     net, model_config, model_dir = load_model(model_id)
 
     # No need to extract windows for the test set, since it only contains the seed sequence anyway.
-    from data_transforms import DCTTransform
-    test_transform = transforms.Compose([DCTTransform(num_coeffs=model_config.dct_n), ToTensor()])
-
+    test_transform = transforms.Compose([ToTensor()])
     test_data = LMDBDataset(os.path.join(C.DATA_DIR, "test"), transform=test_transform)
     test_loader = DataLoader(test_data,
                              batch_size=model_config.bs_eval,
@@ -113,15 +110,15 @@ def evaluate_test(model_id, viz=False):
     results = dict()
     with torch.no_grad():
         for abatch in test_loader:
-            # Move data to GPU.
             batch_gpu = abatch.to_gpu()
-
-            # Get the predictions.
-            model_out = net(batch_gpu)
+            preds = net(batch_gpu)  # (B, T_out, D)
+            seeds = batch_gpu.poses[:, :model_config.seed_seq_len]  # (B, seed_len, D)
 
             for b in range(abatch.batch_size):
-                results[batch_gpu.seq_ids[b]] = (model_out['predictions'][b].detach().cpu().numpy(),
-                                                 model_out['seed'][b].detach().cpu().numpy())
+                results[batch_gpu.seq_ids[b]] = (
+                    preds[b].cpu().numpy(),
+                    seeds[b].cpu().numpy()
+                )
 
     fname = 'predictions_in{}_out{}.csv'.format(model_config.seed_seq_len, model_config.target_seq_len)
     _export_results(results, os.path.join(model_dir, fname))

@@ -51,24 +51,17 @@ class AMASSBatch(object):
         self.poses = poses
 
     @staticmethod
-    def from_sample_list(sample_list):
-        # existing code that stacks sample.poses, etc.
-
-        poses = torch.stack([sample.poses for sample in sample_list])
-        seq_ids = [sample.seq_id for sample in sample_list]
-
-        batch = AMASSBatch(seq_ids=seq_ids, poses=poses)
-
-        # Add DCT fields
-        batch.dct_input = torch.tensor(
-            np.stack([sample.dct_input for sample in sample_list]), dtype=torch.float32
-        )
-
-        batch.dct_history = torch.tensor(
-            np.stack([sample.dct_history for sample in sample_list]), dtype=torch.float32
-        )
-
-        return batch
+    def from_sample_list(samples):
+        """Collect a set of AMASSSamples into a batch with padding if necessary."""
+        ids = []
+        poses = []
+        for sample in samples:
+            ids.append(sample.seq_id)
+            poses.append(sample.poses)
+        # Here we would typically need to pad the batch, but we assume at thi point windows of fixed sizes are
+        # extracted from an AMASSSample, so no need for any padding.
+        poses = torch.stack(poses)
+        return AMASSBatch(ids, poses)
 
     @property
     def batch_size(self):
@@ -80,9 +73,8 @@ class AMASSBatch(object):
         return self.poses.shape[1]
 
     def to_gpu(self):
-        self.poses = self.poses.to(C.DEVICE)
-        self.dct_input = self.dct_input.to(C.DEVICE)
-        self.dct_history = self.dct_history.to(C.DEVICE)
+        """Move data to GPU."""
+        self.poses = self.poses.to(device=C.DEVICE)
         return self
 
 

@@ -6,6 +6,55 @@ Copyright ETH Zurich, Manuel Kaufmann
 import glob
 import os
 import zipfile
+import torch
+import math
+
+
+def dct(x: torch.Tensor, norm: str = 'ortho') -> torch.Tensor:
+    """
+    Compute the 1D Discrete Cosine Transform (Type II) along the last dimension of x.
+    Args:
+        x: Tensor of shape (..., N)
+        norm: 'ortho' for orthonormal normalization, otherwise no normalization
+    Returns:
+        Tensor of same shape as x containing DCT coefficients.
+    """
+    N = x.shape[-1]
+    # create basis matrix
+    n = torch.arange(N, device=x.device).unsqueeze(1)  # (N, 1)
+    k = torch.arange(N, device=x.device).unsqueeze(0)  # (1, N)
+    basis = torch.cos(math.pi / (2 * N) * (2 * n + 1) * k)  # (N, N)
+    # apply transform
+    X = torch.matmul(x, basis)  # (..., N) @ (N, N) -> (..., N)
+    if norm == 'ortho':
+        X[..., 0] = X[..., 0] / math.sqrt(N)
+        X[..., 1:] = X[..., 1:] * math.sqrt(2.0 / N)
+    return X
+
+
+def idct(X: torch.Tensor, norm: str = 'ortho') -> torch.Tensor:
+    """
+    Compute the 1D Inverse Discrete Cosine Transform (Type II inverse) along the last dimension of X.
+    Args:
+        X: Tensor of shape (..., N) with DCT coefficients
+        norm: 'ortho' for orthonormal normalization, otherwise no normalization
+    Returns:
+        Tensor of same shape as X representing the reconstructed signal.
+    """
+    N = X.shape[-1]
+    # create basis matrix
+    n = torch.arange(N, device=X.device).unsqueeze(1)  # (N, 1)
+    k = torch.arange(N, device=X.device).unsqueeze(0)  # (1, N)
+    basis = torch.cos(math.pi / (2 * N) * (2 * n + 1) * k)  # (N, N)
+    # undo normalization
+    Y = X.clone()
+    if norm == 'ortho':
+        Y[..., 0] = Y[..., 0] * math.sqrt(N)
+        Y[..., 1:] = Y[..., 1:] / math.sqrt(2.0 / N)
+    # inverse transform
+    x = torch.matmul(Y, basis) * (2.0 / N)
+    return x
+
 
 
 def create_model_dir(experiment_main_dir, experiment_id, model_summary):
