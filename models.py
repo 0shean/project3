@@ -42,6 +42,8 @@ class BaseModel(nn.Module):
         )
 
     def forward(self, batch):
+        print(type(batch))
+        print(dir(batch))
         seq = batch.seqs
         input_seq = seq[:, :120]
         target_seq = seq[:, 120:]
