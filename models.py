@@ -5,16 +5,37 @@ Copyright ETH Zurich, Manuel Kaufmann
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from data import AMASSBatch
 from losses import mse
 from losses import mpjpe, angle_loss
-
+from data import AMASSBatch
+from losses import mpjpe, angle_loss
 
 def create_model(config):
     # This is a helper function that can be useful if you have several model definitions that you want to
     # choose from via the command line. For now, we just return the Dummy model.
     return BaseModel(config)
+
+
+class StructuredPredictionLayer(nn.Module):
+    def __init__(self, in_dim, joint_dim, joint_names):
+        super().__init__()
+        self.joint_names = joint_names
+        # one MLP per joint
+        self.joint_mlps = nn.ModuleDict({
+            j: nn.Sequential(
+                nn.Linear(in_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, joint_dim)
+            ) for j in joint_names
+        })
+
+    def forward(self, x):
+        # x: [B, in_dim]
+        outs = [ self.joint_mlps[j](x) for j in self.joint_names ]
+        return torch.cat(outs, dim=-1)  # [B, num_joints*joint_dim]
 
 
 class BaseModel(nn.Module):
@@ -34,12 +55,15 @@ class BaseModel(nn.Module):
             batch_first=True
         )
 
-        # MLP head for predicting deltas (residuals)
-        self.mlp = nn.Sequential(
+        # two-layer residual head → split per‐joint final mapping
+        self.mlp_pre = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size, self.input_size)
-        )
+            nn.ReLU())
+        #assume config.joint_names is a list of your 15 SMPL joints
+        joint_names = config.joint_names
+        # each joint has pose_size / len(joint_names) dims (e.g. 9)
+        joint_dim = self.input_size // len(joint_names)
+        self.spl = StructuredPredictionLayer(in_dim = self.hidden_size, joint_dim = joint_dim, joint_names = joint_names)
 
     def forward(self, batch):
         seq = batch.poses
@@ -54,7 +78,8 @@ class BaseModel(nn.Module):
         for _ in range(self.pred_frames):
             x_t_input = x_t.unsqueeze(1)
             out, h = self.gru(x_t_input, h)
-            delta = self.mlp(out.squeeze(1))
+            hidden = self.mlp_pre(out.squeeze(1))
+            delta = self.spl(hidden)
             x_t = x_t + delta
             outputs.append(x_t)
 
@@ -93,6 +118,10 @@ class BaseModel(nn.Module):
     def model_name(self):
         """A summary string of this model. Override this if desired."""
         return '{}-lr{}'.format(self.__class__.__name__, self.config.lr)
+
+
+
+
 
 
 class DummyModel(BaseModel):
