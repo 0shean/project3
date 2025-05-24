@@ -23,8 +23,8 @@ class Constants(object):
             # Environment setup.
             self.DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             self.DTYPE = torch.float32
-            #self.DATA_DIR = os.environ['MP_DATA']
-            #self.EXPERIMENT_DIR = os.environ['MP_EXPERIMENTS']
+            self.DATA_DIR = os.environ['MP_DATA']
+            self.EXPERIMENT_DIR = os.environ['MP_EXPERIMENTS']
             self.METRIC_TARGET_LENGTHS = [5, 10, 19, 24]  # @ 60 fps, in ms: 83.3, 166.7, 316.7, 400
 
     instance = None
