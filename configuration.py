@@ -57,7 +57,12 @@ class Configuration(object):
     def parse_cmd():
         parser = argparse.ArgumentParser()
 
-        # … existing args …
+        # General.
+        parser.add_argument('--data_workers', type=int, default=4, help='Number of parallel threads for data loading.')
+        parser.add_argument('--print_every', type=int, default=200, help='Print stats to console every so many iters.')
+        parser.add_argument('--eval_every', type=int, default=400, help='Evaluate validation set every so many iters.')
+        parser.add_argument('--tag', default='', help='A custom tag for this experiment.')
+        parser.add_argument('--seed', type=int, default=None, help='Random number generator seed.')
 
         # Data.
         parser.add_argument('--seed_seq_len', type=int, default=120, help='Number of frames for the seed length.')
