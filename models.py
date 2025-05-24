@@ -53,6 +53,7 @@ class BaseModel(nn.Module):
             input_size=self.input_size,
             hidden_size=self.hidden_size,
             num_layers=self.num_layers,
+            dropout=config.dropout,
             batch_first=True
         )
 
