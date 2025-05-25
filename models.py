@@ -13,13 +13,36 @@ from losses import mpjpe, angle_loss
 from data import AMASSBatch
 from losses import mpjpe, angle_loss, geodesic_loss
 from fk import SMPL_MAJOR_JOINTS, SMPL_JOINTS
+import torch.fft
 
 def create_model(config):
     # This is a helper function that can be useful if you have several model definitions that you want to
     # choose from via the command line. For now, we just return the Dummy model.
     return BaseModel(config)
 
-
+class DCTMotionAttention(nn.Module):
+    """
+    Compute a motion context by taking a real-FFT (as a proxy for DCT-II)
+    over the seed sequence for each joint-dimension, projecting into hidden
+    space, running a small self-attention, and averaging over frequency.
+    """
+    def __init__(self, input_dim, hidden_dim, heads=4):
+        super().__init__()
+        # project each frequency‐bin of size input_dim into hidden_dim
+        self.freq_proj = nn.Linear(input_dim, hidden_dim)
+        # a tiny Transformer‐style self‐attention
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads=heads, batch_first=True)
+    def forward(self, seed_seq):
+        # seed_seq: [B, T_in, D]  where D = input_dim
+        # 1) compute real‐FFT over time dim
+        freq = torch.fft.rfft(seed_seq, dim=1).real        # [B, T′, D], where T′ = T_in//2+1
+        # 2) lift into hidden space
+        feat = self.freq_proj(freq)                        # [B, T′, hidden_dim]
+        # 3) self‐attend over frequencies
+        attn_out, _ = self.attn(feat, feat, feat)          # [B, T′, hidden_dim]
+        # 4) pool over the frequency axis
+        context = attn_out.mean(dim=1)                     # [B, hidden_dim]
+        return context
 class StructuredPredictionLayer(nn.Module):
     def __init__(self, in_dim, joint_dim, joint_names):
         super().__init__()
@@ -61,6 +84,9 @@ class BaseModel(nn.Module):
         self.mlp_pre = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.ReLU())
+
+        # DCT‐based motion attention over the seed window
+        self.motion_att = DCTMotionAttention(input_dim = self.input_size, hidden_dim = self.hidden_size, heads = 4)
         #assume config.joint_names is a list of your 15 SMPL joints
         joint_names = [SMPL_JOINTS[i] for i in SMPL_MAJOR_JOINTS]
         joint_dim = self.input_size // len(joint_names)
@@ -72,6 +98,9 @@ class BaseModel(nn.Module):
         target_seq = seq[:, 120:]
 
         B, T_in, D = input_seq.shape
+
+        motion_ctx = self.motion_att(input_seq)  # [B, hidden_size]
+
         h = None
         x_t = input_seq[:, -1]
         outputs = []
@@ -80,6 +109,7 @@ class BaseModel(nn.Module):
             x_t_input = x_t.unsqueeze(1)
             out, h = self.gru(x_t_input, h)
             hidden = self.mlp_pre(out.squeeze(1))
+            hidden = hidden + motion_ctx
             delta = self.spl(hidden)
             x_t = x_t + delta
             outputs.append(x_t)
