@@ -101,7 +101,7 @@ class BaseModel(nn.Module):
 
         motion_ctx = self.motion_att(input_seq)  # [B, hidden_size]
 
-        h = None
+        _, h = self.gru(input_seq, None)
         x_t = input_seq[:, -1]
         outputs = []
 
