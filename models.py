@@ -11,7 +11,7 @@ from data import AMASSBatch
 from losses import mse
 from losses import mpjpe, angle_loss
 from data import AMASSBatch
-from losses import mpjpe, angle_loss, geodesic_loss
+from losses import mpjpe, geodesic_loss, velocity_loss, bone_length_loss
 from fk import SMPL_MAJOR_JOINTS, SMPL_JOINTS
 import torch.fft
 
@@ -100,16 +100,32 @@ class BaseModel(nn.Module):
         B, T_in, D = input_seq.shape
 
         motion_ctx = self.motion_att(input_seq)  # [B, hidden_size]
+        h0 = motion_ctx.unsqueeze(0).repeat(self.num_layers, 1, 1) # (L,B,H)
 
-        _, h = self.gru(input_seq, None)
+        _, h = self.gru(input_seq, h0)
         x_t = input_seq[:, -1]
         outputs = []
 
-        for _ in range(self.pred_frames):
+        # ground‑truth next frames for scheduled sampling
+        teacher = seq[:, 1:self.config.seed_seq_len + self.pred_frames]
+        def ss_prob(step, k=5000):
+            """Inverse‑sigmoid decay."""
+            return k / (k + torch.exp(torch.tensor(step / k)))
+
+        p = ss_prob(getattr(self, "training_step", 0)) if self.training else 0.0
+
+
+        for t in range(self.pred_frames):
             x_t_input = x_t.unsqueeze(1)
+
+            if self.training and torch.rand(1).item() < p:
+                x_t_input = teacher[:, t].unsqueeze(1)  # teacher forcing
+            else:
+                x_t_input = x_t.unsqueeze(1)
+
             out, h = self.gru(x_t_input, h)
             hidden = self.mlp_pre(out.squeeze(1))
-            hidden = hidden + motion_ctx
+            
             delta = self.spl(hidden)
             x_t = x_t + delta
             outputs.append(x_t)
@@ -138,14 +154,20 @@ class BaseModel(nn.Module):
 
         loss_mpjpe = mpjpe(pred_seq, target_seq)
         loss_geo = geodesic_loss(pred_mat, targ_mat)
-        total_loss = loss_mpjpe + loss_geo
+        loss_vel   = velocity_loss(pred_seq, target_seq)
+        loss_bone  = bone_length_loss(pred_mat, targ_mat)
+
+        total_loss = loss_mpjpe + loss_geo + 0.5 * loss_vel + 0.2 * loss_bone
+
 
         if do_backward:
             total_loss.backward()
 
         loss_dict = {
             'mpjpe': loss_mpjpe.item(),
-            'geodesic_loss': loss_geo.item(),
+            'geo':   loss_geo.item(),
+            'vel':  loss_vel.item(),
+            'bone': loss_bone.item(),
             'total_loss': total_loss.item(),
         }
 

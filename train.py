@@ -169,7 +169,7 @@ def main(config):
 
     # Define the optimizer.
     optimizer = torch.optim.AdamW(net.parameters(), lr = config.lr, weight_decay = config.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
 
     # Training loop.
     global_step = 0
@@ -192,6 +192,9 @@ def main(config):
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             # Update params.
             optimizer.step()
+
+            # store training step inside model for scheduled sampling
+            net.training_step = global_step
 
             elapsed = time.time() - start
 
@@ -241,7 +244,7 @@ def main(config):
 
                 # Make sure the model is in training mode again.
                 net.train()
-                scheduler.step(valid_losses['total_loss'])
+                scheduler.step(epoch + i / len(train_loader))
             global_step += 1
 
     # After the training, evaluate the model on the test and generate the result file that can be uploaded to the
