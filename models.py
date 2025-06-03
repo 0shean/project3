@@ -161,7 +161,7 @@ class BaseModel(nn.Module):
             in_dim=self.hidden_size,
             joint_dim=joint_dim,
             parents=SMPL_PARENTS,
-            mode=config.spl_mode)  # 'sparse' or 'dense'
+            mode='sparse')   # 'sparse' or 'dense'
 
     def forward(self, batch):
         seq = batch.poses
