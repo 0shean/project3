@@ -121,7 +121,7 @@ def evaluate_test(model_id, viz=False):
                 results[batch_gpu.seq_ids[b]] = (model_out['predictions'][b].detach().cpu().numpy(),
                                                  model_out['seed'][b].detach().cpu().numpy())
 
-    fname = 'predictions_in{}_out{}.csv'.format(model_config.seed_seq_len, model_config.target_seq_len)
+    fname = 'predictions_in120_out{}.csv'.format(model_config.output_n)
     _export_results(results, os.path.join(model_dir, fname))
 
     if viz:

@@ -103,7 +103,7 @@ def _evaluate(net, data_loader, metrics_engine):
                 loss_vals_agg[k] += loss_vals[k] * batch_gpu.batch_size
 
             # Compute metrics.
-            metrics_engine.compute_and_aggregate(model_out['predictions'], targets)
+            metrics_engine.compute_and_aggregate(model_out['predictions'], target_seq)
 
             n_samples += batch_gpu.batch_size
 
