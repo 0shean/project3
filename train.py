@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import transforms
 
 from models import BaseModel
-from losses import mpjpe, angle_loss, geodesic_loss
+from losses import mpjpe, angle_loss, geodesic_loss, velocity_diff_loss
 
 
 def _log_loss_vals(loss_vals, writer, global_step, mode_prefix):
@@ -62,22 +62,41 @@ def _evaluate(net, data_loader, metrics_engine):
             model_out = net(batch_gpu)
 
             # Compute the loss.
-            pred_seq = model_out['predictions']
-            target_seq = batch_gpu.poses[:, 120:]  # ground truth targets
+            pred_seq = model_out['predictions']  # (B,24,D)
+            # -------- loss on first predicted frame ----------------------------------
+            seed_len = net.config.seed_seq_len  # 20
+            tgt_len = net.config.target_seq_len  # 1
 
-            # reshape to [B, T, J, 3, 3] to compute geodesic
-            B, T, D = pred_seq.shape
+            target_seq = batch_gpu.poses[:, seed_len:]  # (B,≥1,D)
+            pred_used = pred_seq[:, :tgt_len]  # (B,1,D)
+            targ_used = target_seq[:, :tgt_len]  # (B,1,D)
+
+            B, T, D = pred_used.shape
             J = D // 9
-            pred_mat = pred_seq.view(B, T, J, 3, 3)
-            targ_mat = target_seq.view(B, T, J, 3, 3)
+            pred_mat = pred_used.view(B, T, J, 3, 3)
+            targ_mat = targ_used.view(B, T, J, 3, 3)
 
-            loss_mpjpe = mpjpe(pred_seq, target_seq)
+            loss_mpjpe = mpjpe(pred_used, targ_used)
             loss_geo = geodesic_loss(pred_mat, targ_mat)
-            total_loss = loss_mpjpe + loss_geo
-            loss_vals = {'mpjpe': loss_mpjpe.item(), 'geodesic_loss': loss_geo.item(), 'total_loss': total_loss.item()}
 
-            targets = target_seq
+            aa_pred = torch.linalg.matrix_exp((pred_mat - pred_mat.transpose(-1, -2)) / 2).reshape(B, T, -1)
+            aa_targ = torch.linalg.matrix_exp((targ_mat - targ_mat.transpose(-1, -2)) / 2).reshape(B, T, -1)
+            loss_ang = angle_loss(aa_pred, aa_targ)
 
+            last_seed = batch_gpu.poses[:, seed_len - 1:seed_len]  # (B,1,D)
+            vel_pred = torch.cat([last_seed, pred_used], 1)
+            vel_targ = torch.cat([last_seed, targ_used], 1)
+            loss_vel = velocity_diff_loss(vel_pred, vel_targ)
+
+            total_loss = loss_mpjpe + loss_geo + 0.5 * loss_ang + 0.25 * loss_vel
+            loss_vals = {'mpjpe': loss_mpjpe.item(),
+                         'geodesic_loss': loss_geo.item(),
+                         'angle_loss': loss_ang.item(),
+                         'velocity_loss': loss_vel.item(),
+                         'total_loss': total_loss.item()}
+
+            targets = target_seq  # keep full 24-frame GT for metrics
+            # -------------------------------------------------------------------------
 
             # Accumulate the loss and multiply with the batch size (because the last batch might have different size).
             for k in loss_vals:

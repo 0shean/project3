@@ -11,7 +11,7 @@ from data import AMASSBatch
 from losses import mse
 from losses import mpjpe, angle_loss
 from data import AMASSBatch
-from losses import mpjpe, geodesic_loss, velocity_loss, bone_length_loss
+from losses import mpjpe, geodesic_loss, angle_loss, velocity_diff_loss
 from fk import SMPL_MAJOR_JOINTS, SMPL_JOINTS
 import torch.fft
 
@@ -94,38 +94,22 @@ class BaseModel(nn.Module):
 
     def forward(self, batch):
         seq = batch.poses
-        input_seq = seq[:, :120]
-        target_seq = seq[:, 120:]
+        input_seq = seq[:, :self.config.seed_seq_len]  # 20
+        target_seq = seq[:, self.config.seed_seq_len:]  # 1
 
         B, T_in, D = input_seq.shape
 
         motion_ctx = self.motion_att(input_seq)  # [B, hidden_size]
-        h0 = motion_ctx.unsqueeze(0).repeat(self.num_layers, 1, 1) # (L,B,H)
 
-        _, h = self.gru(input_seq, h0)
+        _, h = self.gru(input_seq, None)
         x_t = input_seq[:, -1]
         outputs = []
 
-        # ground‑truth next frames for scheduled sampling
-        teacher = seq[:, 1:self.config.seed_seq_len + self.pred_frames]
-        def ss_prob(step, k=5000):
-            """Inverse‑sigmoid decay."""
-            return k / (k + torch.exp(torch.tensor(step / k)))
-
-        p = ss_prob(getattr(self, "training_step", 0)) if self.training else 0.0
-
-
-        for t in range(self.pred_frames):
+        for _ in range(self.pred_frames):
             x_t_input = x_t.unsqueeze(1)
-
-            if self.training and torch.rand(1).item() < p:
-                x_t_input = teacher[:, t].unsqueeze(1)  # teacher forcing
-            else:
-                x_t_input = x_t.unsqueeze(1)
-
             out, h = self.gru(x_t_input, h)
             hidden = self.mlp_pre(out.squeeze(1))
-            
+            hidden = hidden + motion_ctx
             delta = self.spl(hidden)
             x_t = x_t + delta
             outputs.append(x_t)
@@ -147,27 +131,41 @@ class BaseModel(nn.Module):
         pred_seq = model_out['predictions']
         target_seq = model_out['target']
 
-        B, T, D = pred_seq.shape
-        J = D // 9  # number of joints (15)
-        pred_mat = pred_seq.view(B, T, J, 3, 3)
-        targ_mat = target_seq.view(B, T, J, 3, 3)
+        # --- use only the first GT frame for the loss ---
+        T_used = self.config.target_seq_len  # 1
+        pred_used = pred_seq[:, :T_used]  # (B,1,D)
+        targ_used = target_seq[:, :T_used]  # (B,1,D)
 
-        loss_mpjpe = mpjpe(pred_seq, target_seq)
+        B, T, D = pred_used.shape
+        J = D // 9
+        pred_mat = pred_used.view(B, T, J, 3, 3)
+        targ_mat = targ_used.view(B, T, J, 3, 3)
+
+        loss_mpjpe = mpjpe(pred_used, targ_used)
         loss_geo = geodesic_loss(pred_mat, targ_mat)
-        loss_vel   = velocity_loss(pred_seq, target_seq)
-        loss_bone  = bone_length_loss(pred_mat, targ_mat)
 
-        total_loss = loss_mpjpe + loss_geo + 0.5 * loss_vel + 0.2 * loss_bone
+        # --- angle loss (axis-angle) ---
+        aa_pred = torch.linalg.matrix_exp((pred_mat - pred_mat.transpose(-1, -2)) / 2).reshape(B, T, -1)
+        aa_targ = torch.linalg.matrix_exp((targ_mat - targ_mat.transpose(-1, -2)) / 2).reshape(B, T, -1)
+        loss_ang = angle_loss(aa_pred, aa_targ)
 
+        # --- velocity loss ---
+        last_seed = batch.poses[:, self.config.seed_seq_len - 1:self.config.seed_seq_len]  # (B,1,D)
+        vel_pred = torch.cat([last_seed, pred_used], dim=1)
+        vel_targ = torch.cat([last_seed, targ_used], dim=1)
+        loss_vel = velocity_diff_loss(vel_pred, vel_targ)  # make sure losses.py has this fn
+
+        total_loss = (1.0 * loss_mpjpe + 1.0 * loss_geo +
+                      0.5 * loss_ang + 0.25 * loss_vel)
 
         if do_backward:
             total_loss.backward()
 
         loss_dict = {
             'mpjpe': loss_mpjpe.item(),
-            'geo':   loss_geo.item(),
-            'vel':  loss_vel.item(),
-            'bone': loss_bone.item(),
+            'geodesic_loss': loss_geo.item(),
+            'angle_loss': loss_ang.item(),
+            'velocity_loss': loss_vel.item(),
             'total_loss': total_loss.item(),
         }
 

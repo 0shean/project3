@@ -65,8 +65,8 @@ class Configuration(object):
         parser.add_argument('--seed', type=int, default=None, help='Random number generator seed.')
 
         # Data.
-        parser.add_argument('--seed_seq_len', type=int, default=120, help='Number of frames for the seed length.')
-        parser.add_argument('--target_seq_len', type=int, default=24, help='How many frames to predict.')
+        parser.add_argument('--seed_seq_len', type=int, default=20, help='Number of frames for the seed length.')
+        parser.add_argument('--target_seq_len', type=int, default=1, help='How many frames to predict.')
 
         # Learning configurations.
         parser.add_argument('--lr', type=float, default=0.002, help='Learning rate.')

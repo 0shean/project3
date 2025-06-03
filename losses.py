@@ -32,14 +32,16 @@ def geodesic_loss(pred_mat, targ_mat, eps=1e-7):
     theta = torch.acos(cos_theta)
     return theta.mean()
 
-# --- Quick‑fix additions ---
-def velocity_loss(pred, target):
-    """L1 on joint velocities."""
-    return torch.mean(torch.abs((pred[:,1:] - pred[:,:-1]) - (target[:,1:] - target[:,:-1])))
+def velocity_loss(seq):
+    vel = seq[:,1:] - seq[:,:-1]        # finite difference
+    return vel.abs().mean()
 
-
-def bone_length_loss(pred_mat, targ_mat):
-    """Preserve bone vector norms (uses first column of rot‑mat as proxy)."""
-    return torch.mean(torch.abs(pred_mat[...,0].norm(dim=-1) - targ_mat[...,0].norm(dim=-1)))
-
+def velocity_diff_loss(pred, targ):
+    """
+    Finite-difference velocity L1 between pred & target.
+    pred, targ: [B, T, D] (rotation-mat or xyz)
+    """
+    v_pred = pred[:, 1:] - pred[:, :-1]
+    v_targ = targ[:, 1:] - targ[:, :-1]
+    return (v_pred - v_targ).abs().mean()
 
