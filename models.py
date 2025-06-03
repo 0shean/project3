@@ -132,7 +132,8 @@ class BaseModel(nn.Module):
         target_seq = model_out['target']
 
         # --- use only the first GT frame for the loss ---
-        T_used = 1  # always one-step loss
+        T_used = self.config.target_seq_len   # 24
+
         pred_used = pred_seq[:, :T_used]  # (B,1,D)
         targ_used = target_seq[:, :T_used]  # (B,1,D)
 
