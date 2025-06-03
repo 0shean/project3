@@ -5,6 +5,30 @@ Copyright ETH Zurich, Manuel Kaufmann
 """
 import torch
 
+
+# --- safe SO(3) log map ----------------------------------------------
+def mat_to_axis_angle(R, eps=1e-6):
+    """
+    R: (..., 3, 3) rotation matrices  (not necessarily perfect)
+    returns (..., 3) axis-angle vectors
+    """
+    cos = ((R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]) - 1) / 2
+    cos = cos.clamp(-1.0 + eps, 1.0 - eps)
+
+    angle = torch.acos(cos)                          # (...,)
+
+    # ‖sin‖ might be tiny when angle≈0 → avoid /0
+    sin = torch.sin(angle).clamp(min=eps)
+
+    # off-diagonal “vee” operator
+    vx = R[..., 2, 1] - R[..., 1, 2]
+    vy = R[..., 0, 2] - R[..., 2, 0]
+    vz = R[..., 1, 0] - R[..., 0, 1]
+    axis = torch.stack((vx, vy, vz), dim=-1) / (2 * sin.unsqueeze(-1))
+
+    return axis * angle.unsqueeze(-1)                # axis-angle
+
+
 def mse(predictions, targets):
     """
     Compute the MSE.

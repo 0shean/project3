@@ -68,8 +68,8 @@ def _evaluate(net, data_loader, metrics_engine):
             tgt_len = net.config.target_seq_len  # 1
 
             target_seq = batch_gpu.poses[:, seed_len:]  # (B,≥1,D)
-            pred_used = pred_seq[:, :tgt_len]  # (B,1,D)
-            targ_used = target_seq[:, :tgt_len]  # (B,1,D)
+            pred_used = pred_seq
+            targ_used = target_seq
 
             B, T, D = pred_used.shape
             J = D // 9

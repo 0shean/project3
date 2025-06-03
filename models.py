@@ -15,6 +15,12 @@ from losses import mpjpe, geodesic_loss, angle_loss, velocity_diff_loss
 from fk import SMPL_MAJOR_JOINTS, SMPL_JOINTS
 import torch.fft
 
+# fk.py already contains SMPL_PARENTS and SMPL_MAJOR_JOINTS
+from fk import SMPL_PARENTS            # list[int] len = n_joints
+from fk import SMPL_JOINTS             # list[str] joint-name lookup
+from losses import mat_to_axis_angle
+
+
 def create_model(config):
     # This is a helper function that can be useful if you have several model definitions that you want to
     # choose from via the command line. For now, we just return the Dummy model.
@@ -61,6 +67,65 @@ class StructuredPredictionLayer(nn.Module):
         outs = [ self.joint_mlps[j](x) for j in self.joint_names ]
         return torch.cat(outs, dim=-1)  # [B, num_joints*joint_dim]
 
+class HierarchicalSPL(nn.Module):
+    """
+    Hierarchical Structured Prediction Layer (SPL)
+    that follows the human kinematic chain.
+    Each joint MLP receives the global context vector h_t
+    *and* the prediction of its parent joint.
+    mode='sparse' : only immediate parent
+    mode='dense'  : concatenation of all ancestor predictions
+    """
+    def __init__(self, in_dim, joint_dim, parents, mode='sparse',
+                 hidden_per_joint=128):
+        super().__init__()
+        self.parents  = parents                      # list[int]
+        self.joint_dim = joint_dim
+        self.mode = mode
+
+        # build one MLP for every joint
+        self.mlps = nn.ModuleList()
+        for j, p in enumerate(parents):
+            # input = context + parent pred(s)
+            anc_mult = 0 if p == -1 else (1 if mode=='sparse'
+                                          else self._depth(j))
+            inp = in_dim + anc_mult * joint_dim
+            self.mlps.append(nn.Sequential(
+                nn.Linear(inp, hidden_per_joint),
+                nn.ReLU(),
+                nn.Linear(hidden_per_joint, joint_dim)
+            ))
+
+    def _depth(self, j):
+        """number of ancestors of joint j (exclusive)"""
+        d = 0
+        while self.parents[j] != -1:
+            j = self.parents[j]; d += 1
+        return d
+
+    def forward(self, h):
+        """
+        h : (B, in_dim) — same for *all* joints at this time-step.
+        Returns concatenated predictions          (B, K*joint_dim)
+        """
+        B = h.size(0)
+        preds = [None] * len(self.parents)
+        for j, mlp in enumerate(self.mlps):
+            parent = self.parents[j]
+            if parent == -1:                          # root
+                inp = h
+            else:
+                if self.mode == 'sparse':
+                    inp = torch.cat([h, preds[parent]], dim=-1)
+                else:                                # dense: all ancestors
+                    chain = []
+                    p = parent
+                    while p != -1:
+                        chain.append(preds[p]); p = self.parents[p]
+                    inp = torch.cat([h] + chain[::-1], dim=-1)
+            preds[j] = torch.tanh(mlp(inp))     # instead of mlp(inp)
+        return torch.cat(preds, dim=-1)
+
 
 class BaseModel(nn.Module):
     def __init__(self, config):
@@ -90,7 +155,13 @@ class BaseModel(nn.Module):
         #assume config.joint_names is a list of your 15 SMPL joints
         joint_names = [SMPL_JOINTS[i] for i in SMPL_MAJOR_JOINTS]
         joint_dim = self.input_size // len(joint_names)
-        self.spl = StructuredPredictionLayer(in_dim = self.hidden_size, joint_dim = joint_dim, joint_names = joint_names)
+        #self.spl = StructuredPredictionLayer(in_dim = self.hidden_size, joint_dim = joint_dim, joint_names = joint_names)
+        joint_dim = config.input_dim // len(SMPL_PARENTS)
+        self.spl = HierarchicalSPL(
+            in_dim=self.hidden_size,
+            joint_dim=joint_dim,
+            parents=SMPL_PARENTS,
+            mode=config.spl_mode)  # 'sparse' or 'dense'
 
     def forward(self, batch):
         seq = batch.poses
@@ -132,10 +203,9 @@ class BaseModel(nn.Module):
         target_seq = model_out['target']
 
         # --- use only the first GT frame for the loss ---
-        T_used = self.config.target_seq_len   # 24
-
-        pred_used = pred_seq[:, :T_used]  # (B,1,D)
-        targ_used = target_seq[:, :T_used]  # (B,1,D)
+        # --- use the FULL 24-frame target ---
+        pred_used = pred_seq  # shape (B, 24, D)
+        targ_used = target_seq
 
         B, T, D = pred_used.shape
         J = D // 9
@@ -146,8 +216,10 @@ class BaseModel(nn.Module):
         loss_geo = geodesic_loss(pred_mat, targ_mat)
 
         # --- angle loss (axis-angle) ---
-        aa_pred = torch.linalg.matrix_exp((pred_mat - pred_mat.transpose(-1, -2)) / 2).reshape(B, T, -1)
-        aa_targ = torch.linalg.matrix_exp((targ_mat - targ_mat.transpose(-1, -2)) / 2).reshape(B, T, -1)
+        aa_pred = mat_to_axis_angle(pred_mat)  # (B, T, J, 3)
+        aa_targ = mat_to_axis_angle(targ_mat)
+        aa_pred = aa_pred.reshape(B, T, -1)  # flatten joint dim
+        aa_targ = aa_targ.reshape(B, T, -1)
         loss_ang = angle_loss(aa_pred, aa_targ)
 
         # --- velocity loss ---
