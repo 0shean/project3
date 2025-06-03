@@ -151,17 +151,35 @@ class BaseModel(nn.Module):
             nn.ReLU())
 
         # DCT‐based motion attention over the seed window
-        self.motion_att = DCTMotionAttention(input_dim = self.input_size, hidden_dim = self.hidden_size, heads = 4)
-        #assume config.joint_names is a list of your 15 SMPL joints
-        joint_names = [SMPL_JOINTS[i] for i in SMPL_MAJOR_JOINTS]
-        joint_dim = self.input_size // len(joint_names)
-        #self.spl = StructuredPredictionLayer(in_dim = self.hidden_size, joint_dim = joint_dim, joint_names = joint_names)
-        joint_dim = config.input_dim // len(SMPL_PARENTS)
+        # DCT‐based motion attention over the seed window
+        # --------------------------------------------------------------------------
+        # DCT-based motion attention over the seed window
+        self.motion_att = DCTMotionAttention(
+            input_dim=self.input_size,
+            hidden_dim=self.hidden_size,
+            heads=4)
+
+        # --------------------------------------------------------------------------
+        # >>> NEW CODE – Hierarchical SPL for the 15 *major* SMPL joints <<<
+        #
+        # We keep the 15-joint pose vector (135 numbers) that the dataloader gives.
+        # So: joint_dim = 9 and parents = length-15 list aligned with those joints.
+        #
+        joint_dim = self.input_size // len(SMPL_MAJOR_JOINTS)  # 135 // 15 = 9
+
+        # Build a parent index list *restricted to the 15 major joints*
+        major_parents = []
+        for j in SMPL_MAJOR_JOINTS:  # iterate over the 15 joint IDs
+            p = SMPL_PARENTS[j]  # parent in the full 24-joint tree
+            major_parents.append(
+                SMPL_MAJOR_JOINTS.index(p) if p in SMPL_MAJOR_JOINTS else -1)
+
         self.spl = HierarchicalSPL(
             in_dim=self.hidden_size,
-            joint_dim=joint_dim,
-            parents=SMPL_PARENTS,
-            mode='sparse')   # 'sparse' or 'dense'
+            joint_dim=joint_dim,  # 9 numbers per joint
+            parents=major_parents,  # length-15 parent list
+            mode='sparse')  # or 'dense' if you prefer
+        # --------------------------------------------------------------------------
 
     def forward(self, batch):
         seq = batch.poses
