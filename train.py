@@ -95,7 +95,10 @@ def _evaluate(net, data_loader, metrics_engine):
                          'velocity_loss': loss_vel.item(),
                          'total_loss': total_loss.item()}
 
-            targets = target_seq  # keep full 24-frame GT for metrics
+            targets = target_seq  # NOT targ_used
+            metrics_engine.compute_and_aggregate(model_out['predictions'], target_seq)  # 24-frame GT
+
+
             # -------------------------------------------------------------------------
 
             # Accumulate the loss and multiply with the batch size (because the last batch might have different size).
