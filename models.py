@@ -15,6 +15,9 @@ from losses import mpjpe, geodesic_loss, angle_loss, velocity_diff_loss
 from fk import SMPL_MAJOR_JOINTS, SMPL_JOINTS
 import torch.fft
 
+import math
+import random
+
 # fk.py already contains SMPL_PARENTS and SMPL_MAJOR_JOINTS
 from fk import SMPL_PARENTS            # list[int] len = n_joints
 from fk import SMPL_JOINTS             # list[str] joint-name lookup
@@ -132,6 +135,8 @@ class BaseModel(nn.Module):
         self.num_layers = config.num_layers       # e.g. 2
         self.pred_frames = config.output_n        # e.g. 24
 
+        self.ss_k = 1500
+
         # ─── core GRU ──────────────────────────────────────────────────────────
         self.gru = nn.GRU(
             input_size=self.input_size,
@@ -173,14 +178,29 @@ class BaseModel(nn.Module):
         x_t = input_seq[:, -1]
         outputs = []
 
-        for _ in range(self.pred_frames):
+        for t in range(self.pred_frames):
             out, h = self.gru(x_t.unsqueeze(1), h)
             hidden = self.mlp_pre(out.squeeze(1))
             # gated addition of motion context
             gate = torch.tanh(self.gate_fc(hidden))
             hidden = hidden + gate * motion_ctx
             delta = self.spl(hidden)
-            x_t = x_t + delta
+            # ------------------------------------------------------------------
+            # decide what to feed next: ground-truth vs. model prediction
+            # ------------------------------------------------------------------
+            pred_frame = x_t + delta  # model’s proposal
+
+            if self.training:
+                step = getattr(self, "training_step", 0)
+                p_tf = self.ss_k / (self.ss_k + math.exp(step / self.ss_k))
+                # draw Bernoulli mask once per sample in the batch
+                mask = torch.rand(pred_frame.size(0), device=pred_frame.device) < p_tf
+                # broadcast mask over feature dim
+                mask = mask.float().unsqueeze(-1).repeat(1, pred_frame.size(1))
+                gt_frame = target_seq[:, t]  # B×D
+                x_t = mask * gt_frame + (1 - mask) * pred_frame
+            else:
+                x_t = pred_frame
             outputs.append(x_t)
 
         pred_seq = torch.stack(outputs, dim=1)
