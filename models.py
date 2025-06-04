@@ -186,14 +186,30 @@ class BaseModel(nn.Module):
         x_t = input_seq[:, -1]
         outputs = []
 
+        B = input_seq.size(0)
+        J = len(self.major_parents)  # 15 joints
+
         for _ in range(self.pred_frames):
-            out, h = self.gru(x_t.unsqueeze(1), h)
+            # 1) Autoregressive GRU step
+            x_t_in = x_t.unsqueeze(1)  # (B,1,135)
+            out, h = self.gru(x_t_in, h)
             hidden = self.mlp_pre(out.squeeze(1))
-            # gated addition of motion context
-            gate = torch.tanh(self.gate_fc(hidden))
+            gate = torch.sigmoid(self.gate_fc(hidden))  # if you added the gate
             hidden = hidden + gate * motion_ctx
-            delta = self.spl(hidden)
-            x_t = x_t + delta
+
+            # 2) SPL predicts ∆R in 6-D (B, 15*6)
+            delta6 = self.spl(hidden)  # (B,90)
+
+            # 3) Convert running pose & delta to matrices
+            x_t_mat = x_t.view(B, J, 3, 3)  # (B,15,3,3)
+            delta_mat = rot6d_to_matrix(delta6.view(B, J, 6))
+
+            # 4) Apply the relative rotation  R_new = ∆R · R_prev
+            x_t_new_mat = torch.matmul(delta_mat, x_t_mat)  # (B,15,3,3)
+
+            # 5) Flatten back to 135-D for next step / loss
+            x_t = x_t_new_mat.reshape(B, -1)  # (B,135)
+
             outputs.append(x_t)
 
         pred_seq = torch.stack(outputs, dim=1)
