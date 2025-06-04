@@ -69,10 +69,20 @@ class Configuration(object):
         parser.add_argument('--target_seq_len', type=int, default=24, help='How many frames to predict.')
 
         # Learning configurations.
-        parser.add_argument('--lr', type=float, default=0.001, help='Learning rate.')
+        parser.add_argument('--lr', type=float, default=0.005, help='Learning rate.')
         parser.add_argument('--n_epochs', type=int, default=50, help='Number of epochs.')
         parser.add_argument('--bs_train', type=int, default=16, help='Batch size for the training set.')
         parser.add_argument('--bs_eval', type=int, default=16, help='Batch size for valid/test set.')
+
+        parser.add_argument('--input_dim', type=int, default=135)
+        parser.add_argument('--hidden_size', type=int, default=512)
+        parser.add_argument('--num_layers', type=int, default=2)
+        parser.add_argument('--output_n', type=int, default=24)
+
+        parser.add_argument('--weight_decay', type=float, default=0.0, help='L2 penalty on weights.')
+        parser.add_argument('--lr_decay', type=float, default=1.0, help='Multiply LR by this every decay step.')
+        parser.add_argument('--lr_decay_every', type=int, default=100, help='Decay LR every N epochs.')
+        parser.add_argument('--dropout', type=float, default=0.0, help='GRU dropout between layers.')
 
         config = parser.parse_args()
         return Configuration(vars(config))
