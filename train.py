@@ -26,6 +26,8 @@ from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 from torchvision.transforms import transforms
 
+
+
 from models import BaseModel
 from losses import mpjpe, angle_loss, geodesic_loss, velocity_diff_loss
 
@@ -79,20 +81,23 @@ def _evaluate(net, data_loader, metrics_engine):
             loss_mpjpe = mpjpe(pred_used, targ_used)
             loss_geo = geodesic_loss(pred_mat, targ_mat)
 
-            aa_pred = torch.linalg.matrix_exp((pred_mat - pred_mat.transpose(-1, -2)) / 2).reshape(B, T, -1)
-            aa_targ = torch.linalg.matrix_exp((targ_mat - targ_mat.transpose(-1, -2)) / 2).reshape(B, T, -1)
-            loss_ang = angle_loss(aa_pred, aa_targ)
 
             last_seed = batch_gpu.poses[:, seed_len - 1:seed_len]  # (B,1,D)
             vel_pred = torch.cat([last_seed, pred_used], 1)
             vel_targ = torch.cat([last_seed, targ_used], 1)
             loss_vel = velocity_diff_loss(vel_pred, vel_targ)
 
-            total_loss = loss_mpjpe + loss_geo + 0.5 * loss_ang + 0.25 * loss_vel
+            from models import joint_angle_loss  # top-of-file import not needed
+            loss_jangle = joint_angle_loss(pred_mat, targ_mat, net.major_parents)
+
+            total_loss = (1.0 * loss_mpjpe +
+                          1.0 * loss_geo +
+                          0.25 * loss_vel +
+                          0.2 * loss_jangle)
             loss_vals = {'mpjpe': loss_mpjpe.item(),
                          'geodesic_loss': loss_geo.item(),
-                         'angle_loss': loss_ang.item(),
                          'velocity_loss': loss_vel.item(),
+                         'joint_angle': loss_jangle.item(),
                          'total_loss': total_loss.item()}
 
             targets = target_seq  # NOT targ_used
@@ -105,8 +110,6 @@ def _evaluate(net, data_loader, metrics_engine):
             for k in loss_vals:
                 loss_vals_agg[k] += loss_vals[k] * batch_gpu.batch_size
 
-            # Compute metrics.
-            metrics_engine.compute_and_aggregate(model_out['predictions'], target_seq)
 
             n_samples += batch_gpu.batch_size
 

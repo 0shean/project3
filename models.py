@@ -45,6 +45,36 @@ def so3_log(R, eps=1e-6):
     return scale.unsqueeze(-1) * w
 
 
+# ─── forward-kinematics helpers ──────────────────────────────────────────
+def local_to_global(rot_local, parents):
+    """
+    rot_local : (B,T,J,3,3)  local rotations
+    parents   : list[int] length-J, −1 for root
+    returns   : (B,T,J,3,3)  global rotations
+    """
+    rot_global = rot_local.clone()
+    for j in range(1, len(parents)):          # root (0) already global
+        p = parents[j]
+        if p != -1:
+            rot_global[..., j, :, :] = torch.matmul(
+                rot_global[..., p, :, :], rot_global[..., j, :, :])
+    return rot_global
+
+def joint_angle_loss(pred_mat, targ_mat, parents, eps=1e-6):
+    """
+    Mean global joint-angle error (radians) over all joints & frames.
+    """
+    Rg_pred = local_to_global(pred_mat, parents)
+    Rg_targ = local_to_global(targ_mat, parents)
+    R_err   = torch.matmul(Rg_pred, Rg_targ.transpose(-1, -2))
+    cos = (R_err[...,0,0] + R_err[...,1,1] + R_err[...,2,2] - 1) / 2
+    cos = cos.clamp(-1 + eps, 1 - eps)
+    angle = torch.acos(cos)
+    return angle.mean()
+# ─────────────────────────────────────────────────────────────────────────
+
+
+
 
 def create_model(config):
     # This is a helper function that can be useful if you have several model definitions that you want to
@@ -198,6 +228,7 @@ class BaseModel(nn.Module):
             p = SMPL_PARENTS[j]  # parent in the full 24-joint tree
             major_parents.append(
                 SMPL_MAJOR_JOINTS.index(p) if p in SMPL_MAJOR_JOINTS else -1)
+            self.major_parents = major_parents
 
         self.spl = HierarchicalSPL(
             in_dim=self.hidden_size,
@@ -255,13 +286,11 @@ class BaseModel(nn.Module):
         pred_mat = pred_used.view(B, T, J, 3, 3)
         targ_mat = targ_used.view(B, T, J, 3, 3)
 
+        loss_jangle = joint_angle_loss(
+        pred_mat, targ_mat, parents=self.major_parents)
+
         loss_mpjpe = mpjpe(pred_used, targ_used)
         loss_geo = geodesic_loss(pred_mat, targ_mat)
-
-        # --- angle loss (axis-angle) ---
-        aa_pred = so3_log(pred_mat).reshape(B, T, -1)
-        aa_targ = so3_log(targ_mat).reshape(B, T, -1)
-        loss_ang = angle_loss(aa_pred, aa_targ)
 
         # --- velocity loss ---
         last_seed = batch.poses[:, self.config.seed_seq_len - 1:self.config.seed_seq_len]  # (B,1,D)
@@ -269,8 +298,11 @@ class BaseModel(nn.Module):
         vel_targ = torch.cat([last_seed, targ_used], dim=1)
         loss_vel = velocity_diff_loss(vel_pred, vel_targ)  # make sure losses.py has this fn
 
-        total_loss = (1.0 * loss_mpjpe + 1.0 * loss_geo +
-                      0.5 * loss_ang + 0.25 * loss_vel)
+        # total_loss                                              AFTER
+        total_loss = (1.0 * loss_mpjpe +
+                      1.0 * loss_geo +
+                      0.25 * loss_vel +
+                      0.2 * loss_jangle)
 
         if do_backward:
             total_loss.backward()
@@ -278,8 +310,8 @@ class BaseModel(nn.Module):
         loss_dict = {
             'mpjpe': loss_mpjpe.item(),
             'geodesic_loss': loss_geo.item(),
-            'angle_loss': loss_ang.item(),
             'velocity_loss': loss_vel.item(),
+            'joint_angle': loss_jangle.item(),  # ← new
             'total_loss': total_loss.item(),
         }
 
