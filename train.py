@@ -201,6 +201,9 @@ def main(config):
     best_valid_loss = float('inf')
     for epoch in range(config.n_epochs):
 
+        train_loss_vals_agg = collections.defaultdict(float)
+        n_train_samples = 0
+
         for i, abatch in enumerate(train_loader):
             start = time.time()
             optimizer.zero_grad()
@@ -214,6 +217,11 @@ def main(config):
 
             # Compute gradients.
             train_losses, targets = net.backward(batch_gpu, model_out)
+
+            # Accumulate weighted training losses
+            for k in train_losses:
+                train_loss_vals_agg[k] += train_losses[k] * batch_gpu.batch_size
+            n_train_samples += batch_gpu.batch_size
 
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             # Update params.
@@ -231,8 +239,8 @@ def main(config):
 
             if global_step % (config.print_every - 1) == 0:
                 loss_string = ' '.join(['{}: {:.6f}'.format(k, train_losses[k]) for k in train_losses])
-                print('[TRAIN {:0>5d} | {:0>3d}] {} elapsed: {:.3f} secs'.format(
-                    i + 1, epoch + 1, loss_string, elapsed))
+                #print('[TRAIN {:0>5d} | {:0>3d}] {} elapsed: {:.3f} secs'.format(
+                #    i + 1, epoch + 1, loss_string, elapsed))
                 me.reset()
                 me.compute_and_aggregate(model_out['predictions'], targets)
                 me.to_tensorboard_log(me.get_final_metrics(), writer, global_step, 'train')
@@ -247,9 +255,9 @@ def main(config):
 
                 # Log to console.
                 loss_string = ' '.join(['{}: {:.6f}'.format(k, valid_losses[k]) for k in valid_losses])
-                print('[VALID {:0>5d} | {:0>3d}] {} elapsed: {:.3f} secs'.format(
-                    i + 1, epoch + 1, loss_string, elapsed))
-                print('[VALID {:0>5d} | {:0>3d}] {}'.format(i+1, epoch+1, me.get_summary_string(valid_metrics)))
+                #print('[VALID {:0>5d} | {:0>3d}] {} elapsed: {:.3f} secs'.format(
+                #    i + 1, epoch + 1, loss_string, elapsed))
+                #print('[VALID {:0>5d} | {:0>3d}] {}'.format(i+1, epoch+1, me.get_summary_string(valid_metrics)))
 
                 # Log to tensorboard.
                 _log_loss_vals(valid_losses, writer, global_step, 'valid')
@@ -271,6 +279,12 @@ def main(config):
                 # Make sure the model is in training mode again.
                 net.train()
                 scheduler.step(epoch + i / len(train_loader))
+
+            # Compute average training loss
+            avg_train_losses = {k: v / n_train_samples for k, v in train_loss_vals_agg.items()}
+            loss_string = ' '.join(['{}: {:.6f}'.format(k, avg_train_losses[k]) for k in avg_train_losses])
+            print('[EPOCH TRAIN {:0>3d}] {}'.format(epoch + 1, loss_string))
+
             global_step += 1
 
     # After the training, evaluate the model on the test and generate the result file that can be uploaded to the
