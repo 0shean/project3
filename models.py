@@ -71,7 +71,7 @@ class BaseModel(nn.Module):
         self.pred_frames = config.output_n         # e.g., 24
         self.dropout = config.dropout              # e.g., 0.1
         self.sched_sampling_prob = 1.0             # initial teacher-forcing ratio
-        self.sched_sampling_decay = config.sched_sampling_decay  # e.g., 0.05 per epoch
+        self.sched_sampling_decay = 0.05  # e.g., 0.05 per epoch
 
         # GRU for autoregressive modeling (we add dropout on inputs manually)
         self.gru = nn.GRU(
