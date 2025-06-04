@@ -22,27 +22,31 @@ from losses import mat_to_axis_angle
 
 
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 def local_to_global(rot_local, parents):
     """
-    rot_local : (B, T, J, 3, 3)  local rotations
-    parents   : list[int] length J, -1 for root
-    returns   : (B, T, J, 3, 3)   global rotations
-    This version never does in-place writes, so autograd is happy.
+    rot_local : (B, T, J, 3, 3) — local rotations for the J subset joints
+    parents   : list[int] length-J, −1 for joints whose parent is not
+                in the subset (including the pelvis root)
+    returns   : (B, T, J, 3, 3)  global rotations
     """
+
     B, T, J, _, _ = rot_local.shape
-    # keep a Python list, each item is (B,T,3,3)
-    globals_list = [None] * J
-    globals_list[0] = rot_local[..., 0, :, :]           # root
+    glob = [None] * J                                     # Python list
 
-    for j in range(1, J):
+    for j in range(J):
         p = parents[j]
-        globals_list[j] = torch.matmul(
-            globals_list[p],                            # global parent
-            rot_local[..., j, :, :]                     # local child
-        )
+        if p == -1:                                       # own root
+            glob[j] = rot_local[..., j, :, :]
+        else:
+            glob[j] = torch.matmul(
+                glob[p],                                  # parent already done
+                rot_local[..., j, :, :]
+            )
 
-    return torch.stack(globals_list, dim=2)             # (B,T,J,3,3)
+    return torch.stack(glob, dim=2)                       # (B,T,J,3,3)
 # --------------------------------------------------------------------------
+
 
 
 
