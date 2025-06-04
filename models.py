@@ -68,11 +68,6 @@ def joint_angle_loss(pred_mat, targ_mat, parents, eps=1e-6):
     angle = torch.acos(cos)
     return angle.mean()
 
-# Placeholder loss functions that should exist elsewhere in your repo
-mpjpe = lambda p, t: ((p - t) ** 2).sum(dim=-1).sqrt().mean()
-geodesic_loss = lambda p, t: ((p - t) ** 2).mean()
-velocity_diff_loss = lambda p, t: ((p[:, 1:] - p[:, :-1]) - (t[:, 1:] - t[:, :-1])).abs().mean()
-
 # ───────────────────────────────────────────────────────────────────────────────
 #  Model components
 # ───────────────────────────────────────────────────────────────────────────────
