@@ -21,6 +21,31 @@ from fk import SMPL_JOINTS             # list[str] joint-name lookup
 from losses import mat_to_axis_angle
 
 
+# --------------------------------------------------------------------------
+def local_to_global(rot_local, parents):
+    """
+    rot_local : (B, T, J, 3, 3)  local rotations
+    parents   : list[int] length J, -1 for root
+    returns   : (B, T, J, 3, 3)   global rotations
+    This version never does in-place writes, so autograd is happy.
+    """
+    B, T, J, _, _ = rot_local.shape
+    # keep a Python list, each item is (B,T,3,3)
+    globals_list = [None] * J
+    globals_list[0] = rot_local[..., 0, :, :]           # root
+
+    for j in range(1, J):
+        p = parents[j]
+        globals_list[j] = torch.matmul(
+            globals_list[p],                            # global parent
+            rot_local[..., j, :, :]                     # local child
+        )
+
+    return torch.stack(globals_list, dim=2)             # (B,T,J,3,3)
+# --------------------------------------------------------------------------
+
+
+
 def so3_log(R, eps=1e-6):
     """
     Log-map of a batch of rotation matrices.
@@ -45,25 +70,8 @@ def so3_log(R, eps=1e-6):
     return scale.unsqueeze(-1) * w
 
 
-# ─── forward-kinematics helpers ──────────────────────────────────────────
-def local_to_global(rot_local, parents):
-    """
-    rot_local : (B,T,J,3,3)  local rotations
-    parents   : list[int] length-J, −1 for root
-    returns   : (B,T,J,3,3)  global rotations
-    """
-    rot_global = rot_local.clone()
-    for j in range(1, len(parents)):          # root (0) already global
-        p = parents[j]
-        if p != -1:
-            rot_global[..., j, :, :] = torch.matmul(
-                rot_global[..., p, :, :], rot_global[..., j, :, :])
-    return rot_global
 
 def joint_angle_loss(pred_mat, targ_mat, parents, eps=1e-6):
-    """
-    Mean global joint-angle error (radians) over all joints & frames.
-    """
     Rg_pred = local_to_global(pred_mat, parents)
     Rg_targ = local_to_global(targ_mat, parents)
     R_err   = torch.matmul(Rg_pred, Rg_targ.transpose(-1, -2))
@@ -71,6 +79,7 @@ def joint_angle_loss(pred_mat, targ_mat, parents, eps=1e-6):
     cos = cos.clamp(-1 + eps, 1 - eps)
     angle = torch.acos(cos)
     return angle.mean()
+
 # ─────────────────────────────────────────────────────────────────────────
 
 
