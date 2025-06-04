@@ -215,12 +215,19 @@ class BaseModel(nn.Module):
         vel_targ = torch.cat([last_seed, targ_short], dim=1)
         loss_vel = velocity_diff_loss(vel_pred, vel_targ)
 
+        # --- first-frame continuity ----------------------------------------------
+        last_seed_mat = last_seed.view(B, 1, J, 3, 3)  # reshape once
+        first_pred_mat = pred_mat[:, 0:1]  # first predicted frame
+        loss_cont = geodesic_loss(first_pred_mat, last_seed_mat)
+        # --------------------------------------------------------------------------
+
         # Weighting (joint‑angle loss weight lowered)
         total_loss = (
-            1.0 * loss_mpjpe
-            + 1.0 * loss_geo
-            + 0.25 * loss_vel
-            + 0.05 * loss_jangle
+                1.0 * loss_mpjpe
+                + 1.0 * loss_geo
+                + 0.25 * loss_vel
+                + 0.50 * loss_cont  # NEW
+                + 0.05 * loss_jangle
         )
 
         if do_backward:
@@ -232,6 +239,7 @@ class BaseModel(nn.Module):
                 "geodesic_loss": loss_geo.item(),
                 "velocity_loss": loss_vel.item(),
                 "joint_angle": loss_jangle.item(),
+                "continuity loss": loss_cont.item(),
                 "total_loss": total_loss.item(),
             },
             target_seq,
