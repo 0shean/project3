@@ -20,7 +20,10 @@ from fk import SMPL_PARENTS            # list[int] len = n_joints
 from fk import SMPL_JOINTS             # list[str] joint-name lookup
 from losses import mat_to_axis_angle
 
-
+def create_model(config):
+    # This is a helper function that can be useful if you have several model definitions that you want to
+    # choose from via the command line. For now, we just return the Dummy model.
+    return BaseModel(config)
 def local_to_global(rot_local, parents):
     B, T, J, _, _ = rot_local.shape
     glob = [None] * J
