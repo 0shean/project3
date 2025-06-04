@@ -24,6 +24,17 @@ def create_model(config):
     # This is a helper function that can be useful if you have several model definitions that you want to
     # choose from via the command line. For now, we just return the Dummy model.
     return BaseModel(config)
+
+
+def rot6d_to_matrix(x):
+    # x: (...,6)
+    x = x.view(*x.shape[:-1], 3, 2)                # (...,3,2)
+    a1, a2 = x[..., 0], x[..., 1]                 # (...,3)
+    b1 = nn.functional.normalize(a1, dim=-1)
+    b2 = nn.functional.normalize(a2 -
+           (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack((b1, b2, b3), dim=-2)      # (...,3,3)
 def local_to_global(rot_local, parents):
     B, T, J, _, _ = rot_local.shape
     glob = [None] * J
@@ -132,6 +143,7 @@ class BaseModel(nn.Module):
         self.num_layers = config.num_layers       # e.g. 2
         self.pred_frames = config.output_n        # e.g. 24
 
+
         # ─── core GRU ──────────────────────────────────────────────────────────
         self.gru = nn.GRU(
             input_size=self.input_size,
@@ -154,6 +166,7 @@ class BaseModel(nn.Module):
             major_parents.append(SMPL_MAJOR_JOINTS.index(p) if p in SMPL_MAJOR_JOINTS else -1)
         self.major_parents = major_parents
 
+        joint_dim = 6
         self.spl = HierarchicalSPL(
             in_dim=self.hidden_size,
             joint_dim=joint_dim,
@@ -191,36 +204,42 @@ class BaseModel(nn.Module):
             return {"predictions": pred_seq, "seed": input_seq[:, -1:]}  # (B,1,135)
 
     # ────────────────────────────────────────────────────────────────────────
-    def backward(self, batch, model_out, do_backward=True):
-        pred_seq = model_out["predictions"]
-        target_seq = model_out["target"]
+    def backward(self, batch, model_out, do_backward: bool = True):
+        pred_seq = model_out["predictions"]  # (B, 24, 15 × 6)
+        target_seq = model_out["target"]  # (B, 24, 15 × 9)
 
-        # Use only first `horizon` frames for all supervised losses
+        # ── curriculum horizon (first 12 frames supervised) ───────────────
         horizon = 12
-        pred_short = pred_seq[:, :horizon]
-        targ_short = target_seq[:, :horizon]
+        pred_short = pred_seq[:, :horizon]  # (B, 12, 90)
+        targ_short = target_seq[:, :horizon]  # (B, 12, 135)
 
-        B, T, D = pred_short.shape
-        J = D // 9
-        pred_mat = pred_short.view(B, T, J, 3, 3)
+        B, T, _ = targ_short.shape
+        J = len(self.major_parents)  # 15
+
+        # ── convert 6-D → 3×3 matrices ────────────────────────────────────
+        pred_mat = rot6d_to_matrix(pred_short.view(B, T, J, 6))  # (B,T,J,3,3)
         targ_mat = targ_short.view(B, T, J, 3, 3)
 
-        loss_jangle = joint_angle_loss(pred_mat, targ_mat, parents=self.major_parents)
-        loss_mpjpe = mpjpe(pred_short, targ_short)
-        loss_geo = geodesic_loss(pred_mat, targ_mat)
+        # also flatten matrices back to 9-D so legacy MPJPE / velocity code still works
+        pred_vec9 = pred_mat.reshape(B, T, J * 9)  # (B,12,135)
 
-        # Velocity loss (prepend last seed frame)
-        last_seed = batch.poses[:, self.config.seed_seq_len - 1 : self.config.seed_seq_len]
-        vel_pred = torch.cat([last_seed, pred_short], dim=1)
+        # ── losses ────────────────────────────────────────────────────────
+        loss_jangle = joint_angle_loss(pred_mat, targ_mat, parents=self.major_parents)
+        loss_geo = geodesic_loss(pred_mat, targ_mat)
+        loss_mpjpe = mpjpe(pred_vec9, targ_short)  # same fn as before
+
+        # velocity loss (prepend last seed frame, still 9-D)
+        last_seed = batch.poses[:, self.config.seed_seq_len - 1: self.config.seed_seq_len]  # (B,1,135)
+        vel_pred = torch.cat([last_seed, pred_vec9], dim=1)
         vel_targ = torch.cat([last_seed, targ_short], dim=1)
         loss_vel = velocity_diff_loss(vel_pred, vel_targ)
 
-        # Weighting (joint‑angle loss weight lowered)
+        # ── total ─────────────────────────────────────────────────────────
         total_loss = (
-            1.0 * loss_mpjpe
-            + 1.0 * loss_geo
-            + 0.25 * loss_vel
-            + 0.05 * loss_jangle
+                1.0 * loss_mpjpe
+                + 1.0 * loss_geo
+                + 0.25 * loss_vel
+                + 0.05 * loss_jangle
         )
 
         if do_backward:
@@ -234,7 +253,7 @@ class BaseModel(nn.Module):
                 "joint_angle": loss_jangle.item(),
                 "total_loss": total_loss.item(),
             },
-            target_seq,
+            target_seq,  # unchanged signature
         )
 
     def model_name(self):

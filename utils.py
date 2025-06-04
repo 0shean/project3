@@ -45,6 +45,7 @@ def export_code(file_list, output_file):
     zipf.close()
 
 
+
 def count_parameters(net):
     """Count number of trainable parameters in `net`."""
     return sum(p.numel() for p in net.parameters() if p.requires_grad)

@@ -26,6 +26,8 @@ from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 from torchvision.transforms import transforms
 
+from collections import defaultdict
+
 
 
 from models import BaseModel
@@ -201,6 +203,9 @@ def main(config):
     best_valid_loss = float('inf')
     for epoch in range(config.n_epochs):
 
+        epoch_loss_sum = defaultdict(float)  # keyed by 'mpjpe', 'total_loss', …
+        epoch_samples = 0
+
         for i, abatch in enumerate(train_loader):
             start = time.time()
             optimizer.zero_grad()
@@ -213,6 +218,11 @@ def main(config):
 
             # Compute gradients.
             train_losses, targets = net.backward(batch_gpu, model_out)
+
+            bs = batch_gpu.batch_size
+            for k, v in train_losses.items():
+                epoch_loss_sum[k] += v * bs
+            epoch_samples += bs
 
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             # Update params.
@@ -271,6 +281,14 @@ def main(config):
                 net.train()
                 scheduler.step(epoch + i / len(train_loader))
             global_step += 1
+
+        # ── NEW: epoch-average log ────────────────────────────────────
+        epoch_loss_avg = {k: epoch_loss_sum[k] / epoch_samples for k in epoch_loss_sum}
+        # Console
+        avg_str = ' '.join(f'{k}: {v:.6f}' for k, v in epoch_loss_avg.items())
+        print(f'[EPOCH {epoch + 1:03d}] AVERAGE {avg_str}')
+        # TensorBoard
+        _log_loss_vals(epoch_loss_avg, writer, global_step, 'train_epoch_avg')
 
     # After the training, evaluate the model on the test and generate the result file that can be uploaded to the
     # submission system. The submission file will be stored in the model directory.
