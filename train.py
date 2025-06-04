@@ -255,9 +255,9 @@ def main(config):
 
                 # Log to console.
                 loss_string = ' '.join(['{}: {:.6f}'.format(k, valid_losses[k]) for k in valid_losses])
-                #print('[VALID {:0>5d} | {:0>3d}] {} elapsed: {:.3f} secs'.format(
-                #    i + 1, epoch + 1, loss_string, elapsed))
-                #print('[VALID {:0>5d} | {:0>3d}] {}'.format(i+1, epoch+1, me.get_summary_string(valid_metrics)))
+                print('[VALID {:0>3d}] {} elapsed: {:.3f} secs'.format(
+                    epoch + 1, loss_string, elapsed))
+                print('[VALID {:0>3d}] {}'.format(epoch+1, me.get_summary_string(valid_metrics)))
 
                 # Log to tensorboard.
                 _log_loss_vals(valid_losses, writer, global_step, 'valid')
@@ -280,12 +280,12 @@ def main(config):
                 net.train()
                 scheduler.step(epoch + i / len(train_loader))
 
-            # Compute average training loss
-            avg_train_losses = {k: v / n_train_samples for k, v in train_loss_vals_agg.items()}
-            loss_string = ' '.join(['{}: {:.6f}'.format(k, avg_train_losses[k]) for k in avg_train_losses])
-            print('[EPOCH TRAIN {:0>3d}] {}'.format(epoch + 1, loss_string))
-
             global_step += 1
+
+        # Compute average training loss
+        avg_train_losses = {k: v / n_train_samples for k, v in train_loss_vals_agg.items()}
+        loss_string = ' '.join(['{}: {:.6f}'.format(k, avg_train_losses[k]) for k in avg_train_losses])
+        print('[EPOCH TRAIN {:0>3d}] {}'.format(epoch + 1, loss_string))
 
     # After the training, evaluate the model on the test and generate the result file that can be uploaded to the
     # submission system. The submission file will be stored in the model directory.
