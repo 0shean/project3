@@ -8,71 +8,306 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from data import AMASSBatch
-from losses import mse
-from losses import mpjpe, angle_loss
-from data import AMASSBatch
-from losses import mpjpe, geodesic_loss, angle_loss, velocity_diff_loss
-from fk import SMPL_MAJOR_JOINTS, SMPL_JOINTS
-import torch.fft
-
-# fk.py already contains SMPL_PARENTS and SMPL_MAJOR_JOINTS
-from fk import SMPL_PARENTS            # list[int] len = n_joints
-from fk import SMPL_JOINTS             # list[str] joint-name lookup
-from losses import mat_to_axis_angle
+from losses import mpjpe, angle_loss, geodesic_loss
+from fk import SMPL_MAJOR_JOINTS, SMPL_JOINTS, compute_forward_kinematics
+import random
 
 def create_model(config):
     # This is a helper function that can be useful if you have several model definitions that you want to
     # choose from via the command line. For now, we just return the Dummy model.
     return BaseModel(config)
 
+def rot6d_to_rotmat(x):
+    """
+    Convert 6D rotation representation to 3x3 rotation matrix.
+    Input: x of shape (..., 6)
+    Output: R of shape (..., 3, 3)
+    Follows Zhou et al. "On the Continuity of Rotation Representations in Neural Networks".
+    """
+    # Split into two 3D vectors
+    x = x.view(*x.shape[:-1], 3, 2)  # (..., 3, 2)
+    a1 = x[..., :, 0]                # (..., 3)
+    a2 = x[..., :, 1]                # (..., 3)
 
-def rot6d_to_matrix(x):
-    # x: (...,6)
-    x = x.view(*x.shape[:-1], 3, 2)                # (...,3,2)
-    a1, a2 = x[..., 0], x[..., 1]                 # (...,3)
-    b1 = nn.functional.normalize(a1, dim=-1)
-    b2 = nn.functional.normalize(a2 -
-           (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1)
-    b3 = torch.cross(b1, b2, dim=-1)
-    return torch.stack((b1, b2, b3), dim=-2)      # (...,3,3)
-def local_to_global(rot_local, parents):
-    B, T, J, _, _ = rot_local.shape
-    glob = [None] * J
-    for j in range(J):
-        p = parents[j]
-        if p == -1:
-            glob[j] = rot_local[..., j, :, :]
+    # Normalize first vector
+    b1 = F.normalize(a1, dim=-1)     # (..., 3)
+    # Make a2 orthogonal to b1
+    dot = (b1 * a2).sum(dim=-1, keepdim=True)  # (..., 1)
+    a2_ortho = a2 - dot * b1                  # (..., 3)
+    b2 = F.normalize(a2_ortho, dim=-1)        # (..., 3)
+    # Third vector via cross product
+    b3 = torch.cross(b1, b2, dim=-1)          # (..., 3)
+
+    # Stack as columns
+    R = torch.stack([b1, b2, b3], dim=-1)     # (..., 3, 3)
+    return R
+class StructuredPrediction6D(nn.Module):
+    def __init__(self, in_dim, joint_dim, joint_names):
+        super().__init__()
+        self.joint_names = joint_names
+        # joint_dim now = 6 for 6D representation
+        self.joint_mlps = nn.ModuleDict({
+            j: nn.Sequential(
+                nn.Linear(in_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, joint_dim)
+            ) for j in joint_names
+        })
+
+    def forward(self, x):
+        # x: [B, in_dim]
+        outs = [ self.joint_mlps[j](x) for j in self.joint_names ]
+        # concatenate: [B, num_joints * 6]
+        return torch.cat(outs, dim=-1)
+
+
+class BaseModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.input_size = config.input_dim         # e.g., 135 (15 joints * 9 dims)
+        self.hidden_size = config.hidden_size      # e.g., 512
+        self.num_layers = config.num_layers        # e.g., 2
+        self.pred_frames = config.output_n         # e.g., 24
+        self.dropout = config.dropout              # e.g., 0.1
+        self.sched_sampling_prob = 1.0             # initial teacher-forcing ratio
+        self.sched_sampling_decay = config.sched_sampling_decay  # e.g., 0.05 per epoch
+
+        # GRU for autoregressive modeling (we add dropout on inputs manually)
+        self.gru = nn.GRU(
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            batch_first=True
+        )
+
+        # Two-layer residual head → hidden to hidden
+        self.mlp_pre = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU()
+        )
+
+        # DCT-based motion attention (unchanged)
+        self.motion_att = DCTMotionAttention(input_dim=self.input_size, hidden_dim=self.hidden_size, heads=4)
+
+        # Structured prediction: now outputs 6D per joint
+        joint_names = [SMPL_JOINTS[i] for i in SMPL_MAJOR_JOINTS]
+        joint_dim = 6
+        self.spl = StructuredPrediction6D(in_dim=self.hidden_size, joint_dim=joint_dim, joint_names=joint_names)
+
+    def forward(self, batch, epoch=None):
+        seq = batch.poses                        # shape (B, T_total, D)
+        input_seq = seq[:, :120]                 # seed frames
+        target_seq = seq[:, 120:]                # future frames for loss
+
+        B, T_in, D = input_seq.shape  # D = 135
+
+        # Compute motion context via DCT attention
+        motion_ctx = self.motion_att(input_seq)   # [B, hidden_size]
+
+        # Encode seed sequence via GRU
+        _, h = self.gru(input_seq, None)          # h: (num_layers, B, H)
+        # Last ground truth frame
+        x_t = input_seq[:, -1]                    # [B, D]
+        outputs_6d = []
+
+        # For tracking velocity regularization, store previous two 6D preds
+        prev6d_1 = None
+        prev6d_2 = None
+
+        for t in range(self.pred_frames):
+            # Optionally apply dropout on input to GRU at each step
+            x_t_dropped = F.dropout(x_t, p=self.dropout, training=self.training)
+            x_t_input = x_t_dropped.unsqueeze(1)  # [B,1,D]
+
+            # One GRU step
+            out, h = self.gru(x_t_input, h)       # out: [B,1,H]
+            hidden = self.mlp_pre(out.squeeze(1))  # [B, H]
+            hidden = hidden + motion_ctx           # add motion context
+
+            # Structured prediction to 6D per joint
+            delta6d = self.spl(hidden)             # [B, J*6]
+
+            # Add delta in 6D space: x_t6d = x_t6d_prev + delta6d
+            # First, convert last predicted 3x3 rotations to 6D if t==0
+            if t == 0:
+                # Convert x_t from 3x3 mat to 6D rep by taking first two columns
+                # We assume seed is valid rotation matrices
+                x_t6d = self.mat_to_6d(x_t)
+            else:
+                x_t6d = prev6d_1
+
+            # Current 6D prediction
+            new6d = x_t6d + delta6d                # [B, J*6]
+            outputs_6d.append(new6d)
+
+            # Convert new6d to 3x3 for next input
+            # reshape to (B, J, 6)
+            new6d_reshaped = new6d.view(B, len(SMPL_MAJOR_JOINTS), 6)
+            R_pred = rot6d_to_rotmat(new6d_reshaped)  # [B, J, 3,3]
+
+            # Flatten back to (B, D)
+            R_flat = R_pred.view(B, -1)             # [B, J*9]
+
+            # If some joints not in major, copy identity for them (optional)
+            # Here we assume D covers only major joints
+            x_t = R_flat
+
+            # Update previous 6D history for velocity loss
+            prev6d_2 = prev6d_1
+            prev6d_1 = new6d
+
+        # Stack all predicted 6D outputs: list of (B, J*6) → (B, T_pred, J*6)
+        pred_seq_6d = torch.stack(outputs_6d, dim=1)
+
+        if self.training:
+            return {
+                'pred6d': pred_seq_6d,   # predicted 6D representations
+                'target': target_seq,     # ground truth 3x3 rotations
+                'seed_last_6d': self.mat_to_6d(input_seq[:, -1])  # last ground truth 6D
+            }
         else:
-            glob[j] = torch.matmul(glob[p], rot_local[..., j, :, :])
-    return torch.stack(glob, dim=2)
+            return {
+                'pred6d': pred_seq_6d,
+                'seed_last_6d': self.mat_to_6d(input_seq[:, -1])
+            }
 
-def so3_log(R, eps=1e-6):
-    trace = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
-    cos = ((trace - 1) / 2).clamp(-1 + eps, 1 - eps)
-    theta = torch.acos(cos)
-    sin_theta = torch.sin(theta)
-    mask = sin_theta.abs() < 1e-4
-    scale = torch.where(mask, 0.5 + (theta ** 2) / 12, theta / (2 * sin_theta))
-    w = torch.stack([
-        R[..., 2, 1] - R[..., 1, 2],
-        R[..., 0, 2] - R[..., 2, 0],
-        R[..., 1, 0] - R[..., 0, 1]
-    ], dim=-1)
-    return scale.unsqueeze(-1) * w
+    def mat_to_6d(self, mat_flat):
+        """
+        Convert flattened 3x3 rotations (shape [B, J*9]) to 6D by taking first two columns.
+        Assumes mat_flat is exact rotation matrices.
+        """
+        B = mat_flat.shape[0]
+        J = len(SMPL_MAJOR_JOINTS)
+        R = mat_flat.view(B, J, 3, 3)
+        # take first two columns for each joint
+        col1 = R[..., :, 0]  # [B, J, 3]
+        col2 = R[..., :, 1]  # [B, J, 3]
+        sixd = torch.cat([col1, col2], dim=-1)  # [B, J, 6]
+        return sixd.view(B, J * 6)
 
-def joint_angle_loss(pred_mat, targ_mat, parents, eps=1e-6):
-    Rg_pred = local_to_global(pred_mat, parents)
-    Rg_targ = local_to_global(targ_mat, parents)
-    R_err = torch.matmul(Rg_pred, Rg_targ.transpose(-1, -2))
-    cos = ((R_err[..., 0, 0] + R_err[..., 1, 1] + R_err[..., 2, 2] - 1) / 2).clamp(-1 + eps, 1 - eps)
-    angle = torch.acos(cos)
-    return angle.mean()
+    def backward(self, batch, model_out, do_backward=True):
+        B = batch.batch_size
+        # Extract predictions and targets
+        pred6d = model_out['pred6d']                 # [B, T_pred, J*6]
+        target_mat = model_out['target']             # [B, T_pred, J*9]
+        seed_last_6d = model_out['seed_last_6d']     # [B, J*6]
 
-# ───────────────────────────────────────────────────────────────────────────────
-#  Model components
-# ───────────────────────────────────────────────────────────────────────────────
+        T = pred6d.shape[1]
+        J = len(SMPL_MAJOR_JOINTS)
 
+        # Convert predicted 6D -> rotation matrices per joint per frame
+        pred6d_reshaped = pred6d.view(B, T, J, 6)
+        predR = rot6d_to_rotmat(pred6d_reshaped)     # [B, T, J, 3, 3]
+
+        # Reshape target to (B, T, J, 3,3)
+        targ_mat = target_mat.view(B, T, J, 3, 3)
+
+        # Geodesic loss on rotations
+        loss_geo = geodesic_loss(predR, targ_mat)
+
+        # MPJPE in 3D joint space (requires forward kinematics to get joint positions)
+        # Compute 3D joint positions from rotation matrices
+        # seed root for t=0 is from last seed frame
+        # Build full poses array (B, T, J, 3,3)
+        fullR = predR
+        # Convert rotations to 3D joint positions (calls a user-provided FK function)
+        # Suppose compute_forward_kinematics takes R of shape [B, T, J, 3,3] and returns positions [B, T, J,3]
+        pred_xyz = compute_forward_kinematics(fullR)
+        targ_xyz = compute_forward_kinematics(targ_mat)
+        loss_mpjpe = F.mse_loss(pred_xyz, targ_xyz)
+
+        # Velocity regularization: encourage smooth changes in 6D space
+        vel_loss = 0.0
+        for t in range(2, T):
+            v_t = pred6d[:, t] - pred6d[:, t-1]
+            v_t1 = pred6d[:, t-1] - pred6d[:, t-2]
+            vel_loss = vel_loss + F.mse_loss(v_t, v_t1)
+        vel_loss = vel_loss / (T - 2)
+
+        # Bone-length consistency: ensure each bone length matches ground truth
+        # pred_xyz and targ_xyz: [B, T, J, 3]
+        bone_loss = 0.0
+        # Suppose compute_forward_kinematics returns joint positions with indices matching SMPL_MAJOR_JOINTS
+        parent_indices = self._get_parent_indices()
+        for t in range(T):
+            for j, p in enumerate(parent_indices):
+                if p < 0:
+                    continue
+                pred_len = torch.norm(pred_xyz[:, t, j] - pred_xyz[:, t, p], dim=-1)
+                targ_len = torch.norm(targ_xyz[:, t, j] - targ_xyz[:, t, p], dim=-1)
+                bone_loss = bone_loss + F.mse_loss(pred_len, targ_len)
+        bone_loss = bone_loss / (T * J)
+
+        # Total loss: weighted sum
+        lambda_geo = 1.0
+        lambda_mpjpe = 1.0
+        lambda_vel = 0.1
+        lambda_bone = 0.5
+
+        total_loss = lambda_geo * loss_geo + lambda_mpjpe * loss_mpjpe + lambda_vel * vel_loss + lambda_bone * bone_loss
+
+        if do_backward:
+            total_loss.backward()
+
+        loss_dict = {
+            'geodesic_loss': loss_geo.item(),
+            'mpjpe_xyz': loss_mpjpe.item(),
+            'vel_loss': vel_loss.item(),
+            'bone_loss': bone_loss.item(),
+            'total_loss': total_loss.item()
+        }
+        return loss_dict, targ_xyz
+
+    def model_name(self):
+        return '{}-lr{}-6D'.format(self.__class__.__name__, self.config.lr)
+
+    def _get_parent_indices(self):
+        """
+        Return list of parent indices for each SMPL_MAJOR_JOINTS joint.
+        Assumes SMPL_JOINTS gives full list; SMPL_MAJOR_JOINTS gives indices of major joints.
+        """
+        # Build a map from joint name to parent name (you may have a dictionary somewhere)
+        # For demo, assume a simple chain
+        parent_map = {
+            'root': -1,
+            'spine': 0,
+            'chest': 1,
+            'neck': 2,
+            'head': 3,
+            'left_shoulder': 1,
+            'left_elbow': 5,
+            'left_wrist': 6,
+            'right_shoulder': 1,
+            'right_elbow': 8,
+            'right_wrist': 9,
+            'left_hip': 0,
+            'left_knee': 12,
+            'left_ankle': 13,
+            'right_hip': 0,
+            'right_knee': 15,
+            'right_ankle': 16
+        }
+        joint_names = [SMPL_JOINTS[i] for i in SMPL_MAJOR_JOINTS]
+        indices = []
+        name_to_idx = {name: i for i, name in enumerate(joint_names)}
+        for name in joint_names:
+            parent_name = parent_map.get(name, None)
+            if parent_name is None or parent_name not in name_to_idx:
+                indices.append(-1)
+            else:
+                indices.append(name_to_idx[parent_name])
+        return indices
+
+
+# Keep the original DCTMotionAttention unchanged
 class DCTMotionAttention(nn.Module):
+    """
+    Compute a motion context by taking a real-FFT (as a proxy for DCT-II)
+    over the seed sequence for each joint-dimension, projecting into hidden
+    space, running a small self-attention, and averaging over frequency.
+    """
     def __init__(self, input_dim, hidden_dim, heads=4):
         super().__init__()
         self.freq_proj = nn.Linear(input_dim, hidden_dim)
@@ -82,247 +317,5 @@ class DCTMotionAttention(nn.Module):
         freq = torch.fft.rfft(seed_seq, dim=1).real
         feat = self.freq_proj(freq)
         attn_out, _ = self.attn(feat, feat, feat)
-        return attn_out.mean(dim=1)
-
-class HierarchicalSPL(nn.Module):
-    def __init__(self, in_dim, joint_dim, parents, mode="dense", hidden_per_joint=64):
-        super().__init__()
-        self.parents = parents
-        self.joint_dim = joint_dim
-        self.mode = mode
-        self.mlps = nn.ModuleList()
-        for j, p in enumerate(parents):
-            anc_mult = 0 if p == -1 else (1 if mode == "sparse" else self._depth(j))
-            inp = in_dim + anc_mult * joint_dim
-            self.mlps.append(nn.Sequential(
-                nn.Linear(inp, hidden_per_joint), nn.ReLU(), nn.Linear(hidden_per_joint, joint_dim)
-            ))
-
-    def _depth(self, j):
-        d = 0
-        while self.parents[j] != -1:
-            j = self.parents[j]
-            d += 1
-        return d
-
-    def forward(self, h):
-        B = h.size(0)
-        preds = [None] * len(self.parents)
-        for j, mlp in enumerate(self.mlps):
-            parent = self.parents[j]
-            if parent == -1:
-                inp = h
-            else:
-                if self.mode == "sparse":
-                    inp = torch.cat([h, preds[parent]], dim=-1)
-                else:
-                    chain = []
-                    p = parent
-                    while p != -1:
-                        chain.append(preds[p])
-                        p = self.parents[p]
-                    inp = torch.cat([h] + chain[::-1], dim=-1)
-            preds[j] = torch.tanh(mlp(inp))
-        return torch.cat(preds, dim=-1)
-
-# ───────────────────────────────────────────────────────────────────────────────
-#  BaseModel
-# ───────────────────────────────────────────────────────────────────────────────
-
-class BaseModel(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.input_size = config.input_dim        # e.g. 135
-        self.hidden_size = config.hidden_size     # e.g. 512
-        self.num_layers = config.num_layers       # e.g. 2
-        self.pred_frames = config.output_n        # e.g. 24
-
-
-        # ─── core GRU ──────────────────────────────────────────────────────────
-        self.gru = nn.GRU(
-            input_size=self.input_size,
-            hidden_size=self.hidden_size,
-            num_layers=self.num_layers,
-            dropout=config.dropout,
-            batch_first=True,
-        )
-
-        # residual MLP + motion context gate
-        self.mlp_pre = nn.Sequential(nn.Linear(self.hidden_size, self.hidden_size), nn.ReLU())
-        self.motion_att = DCTMotionAttention(self.input_size, self.hidden_size, heads=4)
-        self.gate_fc = nn.Linear(self.hidden_size, 1)
-
-        # Build 15‑joint hierarchical SPL (dense mode, smaller MLPs)
-        joint_dim = self.input_size // len(SMPL_MAJOR_JOINTS)  # 9
-        major_parents = []
-        for j in SMPL_MAJOR_JOINTS:
-            p = SMPL_PARENTS[j]
-            major_parents.append(SMPL_MAJOR_JOINTS.index(p) if p in SMPL_MAJOR_JOINTS else -1)
-        self.major_parents = major_parents
-
-        joint_dim = 6
-        self.spl = HierarchicalSPL(
-            in_dim=self.hidden_size,
-            joint_dim=joint_dim,
-            parents=major_parents,
-            mode="dense",
-            hidden_per_joint=64,
-        )
-
-    # ────────────────────────────────────────────────────────────────────────
-    def forward(self, batch):
-        seq = batch.poses
-        input_seq = seq[:, : self.config.seed_seq_len]  # 20
-        target_seq = seq[:, self.config.seed_seq_len :]  # 24
-
-        motion_ctx = self.motion_att(input_seq)
-        _, h = self.gru(input_seq, None)
-        x_t = input_seq[:, -1]
-        outputs = []
-
-        B = input_seq.size(0)
-        J = len(self.major_parents)  # 15 joints
-
-        for _ in range(self.pred_frames):
-            # 1) Autoregressive GRU step
-            x_t_in = x_t.unsqueeze(1)  # (B,1,135)
-            out, h = self.gru(x_t_in, h)
-            hidden = self.mlp_pre(out.squeeze(1))
-            gate = torch.sigmoid(self.gate_fc(hidden))  # if you added the gate
-            hidden = hidden + gate * motion_ctx
-
-            # 2) SPL predicts ∆R in 6-D (B, 15*6)
-            delta6 = self.spl(hidden)  # (B,90)
-
-            # 3) Convert running pose & delta to matrices
-            x_t_mat = x_t.view(B, J, 3, 3)  # (B,15,3,3)
-            delta_mat = rot6d_to_matrix(delta6.view(B, J, 6))
-
-            # 4) Apply the relative rotation  R_new = ∆R · R_prev
-            x_t_new_mat = torch.matmul(delta_mat, x_t_mat)  # (B,15,3,3)
-
-            # 5) Flatten back to 135-D for next step / loss
-            x_t = x_t_new_mat.reshape(B, -1)  # (B,135)
-
-            outputs.append(x_t)
-
-        pred_seq = torch.stack(outputs, dim=1)
-
-        if self.training:
-            return {"predictions": pred_seq, "target": target_seq}
-        else:
-            return {"predictions": pred_seq, "seed": input_seq[:, -1:]}  # (B,1,135)
-
-    # ────────────────────────────────────────────────────────────────────────
-    def backward(self, batch, model_out, do_backward: bool = True):
-        pred_seq = model_out["predictions"]  # (B, 24, 15 × 6)
-        target_seq = model_out["target"]  # (B, 24, 15 × 9)
-
-        # ── curriculum horizon (first 12 frames supervised) ───────────────
-        horizon = 12
-        pred_short = pred_seq[:, :horizon]  # (B, 12, 90)
-        targ_short = target_seq[:, :horizon]  # (B, 12, 135)
-
-        B, T, _ = targ_short.shape
-        J = len(self.major_parents)  # 15
-
-        # ── convert 6-D → 3×3 matrices ────────────────────────────────────
-        pred_mat = pred_short.view(B, T, J, 3, 3)
-        targ_mat = targ_short.view(B, T, J, 3, 3)
-
-        # also flatten matrices back to 9-D so legacy MPJPE / velocity code still works
-        pred_vec9 = pred_short
-
-        # ── losses ────────────────────────────────────────────────────────
-        loss_jangle = joint_angle_loss(pred_mat, targ_mat, parents=self.major_parents)
-        loss_geo = geodesic_loss(pred_mat, targ_mat)
-        loss_mpjpe = mpjpe(pred_vec9, targ_short)  # same fn as before
-
-        # velocity loss (prepend last seed frame, still 9-D)
-        last_seed = batch.poses[:, self.config.seed_seq_len - 1: self.config.seed_seq_len]  # (B,1,135)
-        vel_pred = torch.cat([last_seed, pred_vec9], dim=1)
-        vel_targ = torch.cat([last_seed, targ_short], dim=1)
-        loss_vel = velocity_diff_loss(vel_pred, vel_targ)
-
-        # ── total ─────────────────────────────────────────────────────────
-        total_loss = (
-                1.0 * loss_mpjpe
-                + 1.0 * loss_geo
-                + 0.25 * loss_vel
-                + 0.05 * loss_jangle
-        )
-
-        if do_backward:
-            total_loss.backward()
-
-        return (
-            {
-                "mpjpe": loss_mpjpe.item(),
-                "geodesic_loss": loss_geo.item(),
-                "velocity_loss": loss_vel.item(),
-                "joint_angle": loss_jangle.item(),
-                "total_loss": total_loss.item(),
-            },
-            target_seq,  # unchanged signature
-        )
-
-    def model_name(self):
-        return f"{self.__class__.__name__}-lr{self.config.lr}"
-
-
-
-
-
-
-class DummyModel(BaseModel):
-    """
-    This is a dummy model. It provides basic implementations to demonstrate how more advanced models can be built.
-    """
-
-    def __init__(self, config):
-        self.n_history = 10
-        super(DummyModel, self).__init__(config)
-
-    # noinspection PyAttributeOutsideInit
-    def create_model(self):
-        # In this model we simply feed the last time steps of the seed to a dense layer and
-        # predict the targets directly.
-        self.dense = nn.Linear(in_features=self.n_history * self.pose_size,
-                               out_features=self.config.target_seq_len * self.pose_size)
-
-    def forward(self, batch: AMASSBatch):
-        """
-        The forward pass.
-        :param batch: Current batch of data.
-        :return: Each forward pass must return a dictionary with keys {'seed', 'predictions'}.
-        """
-        model_out = {'seed': batch.poses[:, :self.config.seed_seq_len],
-                     'predictions': None}
-        batch_size = batch.batch_size
-        model_in = batch.poses[:, self.config.seed_seq_len-self.n_history:self.config.seed_seq_len]
-        pred = self.dense(model_in.reshape(batch_size, -1))
-        model_out['predictions'] = pred.reshape(batch_size, self.config.target_seq_len, -1)
-        return model_out
-
-    def backward(self, batch: AMASSBatch, model_out):
-        """
-        The backward pass.
-        :param batch: The same batch of data that was passed into the forward pass.
-        :param model_out: Whatever the forward pass returned.
-        :return: The loss values for book-keeping, as well as the targets for convenience.
-        """
-        predictions = model_out['predictions']
-        targets = batch.poses[:, self.config.seed_seq_len:]
-
-        total_loss = mse(predictions, targets)
-
-        # If you have more than just one loss, just add them to this dict and they will automatically be logged.
-        loss_vals = {'total_loss': total_loss.cpu().item()}
-
-        if self.training:
-            # We only want to do backpropagation in training mode, as this function might also be called when evaluating
-            # the model on the validation set.
-            total_loss.backward()
-
-        return loss_vals, targets
+        context = attn_out.mean(dim=1)
+        return context

@@ -6,6 +6,9 @@ Copyright ETH Zurich, Manuel Kaufmann
 import numpy as np
 import quaternion
 import cv2
+# === Add the following at the bottom of fk.py ===
+
+import torch
 
 SMPL_MAJOR_JOINTS = [1, 2, 3, 4, 5, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19]
 SMPL_NR_JOINTS = 24
@@ -226,3 +229,85 @@ class SMPLForwardKinematics(ForwardKinematics):
         # normalize so that right thigh has length 1
         super(SMPLForwardKinematics, self).__init__(smpl_offsets, SMPL_PARENTS, norm_idx=4,
                                                     left_mult=False, major_joints=SMPL_MAJOR_JOINTS)
+
+
+_PARENT_INDICES_MAJOR = [-1, -1, -1, 0, 1, 2, 5, 6, 6, 6, 7, 8, 9, 11, 12]
+
+# Offsets for those 15 major joints, in the *rest* pose.  Each row is the vector from parent→child,
+# already “SMPL‐normalized.”  This was extracted from SMPL’s numpy offsets (see original SMPLForwardKinematics).
+# Shape: (15, 3)
+_OFFSETS_MAJOR = torch.tensor([
+    [ 0.0713612 , -0.08958381, -0.00804619],
+    [-0.06901202, -0.08896044, -0.00479569],
+    [-0.00250821,  0.10325686, -0.02218514],
+    [ 0.03066892, -0.36420937, -0.00668891],
+    [-0.03615239, -0.37065046, -0.00918532],
+    [ 0.00358096,  0.12765765, -0.00171298],
+    [ 0.00202718,  0.04906964,  0.02786618],
+    [-0.0019626 ,  0.20824406, -0.0497642 ],
+    [ 0.07529248,  0.11778389, -0.03687496],
+    [-0.07704173,  0.11561014, -0.04181263],
+    [ 0.00351696,  0.06232117,  0.05020439],
+    [ 0.08535247,  0.03173072, -0.00727332],
+    [-0.08922328,  0.0327867 , -0.00979219],
+    [ 0.25135765, -0.0119157 , -0.02753304],
+    [-0.2456661 , -0.01329221, -0.02014326]
+], dtype=torch.float32)
+
+
+def compute_forward_kinematics(rot_mats: torch.Tensor) -> torch.Tensor:
+    """
+    Perform forward kinematics on the 15 “major” SMPL joints.
+
+    Args:
+        rot_mats: Tensor of shape (B, T, 15, 3, 3),
+                  representing each joint’s *local* 3×3 rotation matrix
+                  (in the same order as SMPL_MAJOR_JOINTS).
+
+    Returns:
+        Tensor of shape (B, T, 15, 3):  the 3D global positions of those 15 joints,
+        computed by starting at the root (position=0) and traversing the parent chain
+        via (_PARENT_INDICES_MAJOR, _OFFSETS_MAJOR).  All ops are in PyTorch so gradients flow.
+    """
+    B, T, J, _, _ = rot_mats.shape
+    assert J == 15, f"Expected 15 major joints, but got {J}"
+
+    device = rot_mats.device
+
+    # Bring offsets to the same device, shape (15,3)
+    offsets = _OFFSETS_MAJOR.to(device)
+
+    # Pre-allocate tensors for global rotations and positions
+    rotations_global = torch.zeros(B, T, J, 3, 3, device=device)
+    positions = torch.zeros(B, T, J, 3, device=device)
+
+    # Iterate joints in ascending index order; parent indices always < j or = -1
+    for j in range(J):
+        parent = _PARENT_INDICES_MAJOR[j]
+        if parent < 0:
+            # Root‐joint (in our 15‐joint set, these three share no major‐joint parent):
+            #   - Global rotation = local rotation.
+            #   - Global position = [0,0,0].
+            rotations_global[:, :, j] = rot_mats[:, :, j]
+            positions[:, :, j] = 0.0
+        else:
+            # Compute global rotation: parent_global @ local_rot
+            #    shape (B, T, 3, 3) @ (B, T, 3, 3) → (B, T, 3, 3)
+            rotations_global[:, :, j] = torch.matmul(
+                rotations_global[:, :, parent],
+                rot_mats[:, :, j]
+            )
+
+            # World‐offset = parent_global_rot @ offset_vector (→ shape (B, T, 3, 1)), then squeeze
+            # offset[j] has shape (3,), so reshape to (1,1,3,1) to broadcast over (B,T) dims
+            offs = offsets[j].view(1, 1, 3, 1).expand(B, T, 3, 1)   # (B, T, 3, 1)
+            world_offs = torch.matmul(
+                rotations_global[:, :, parent],   # (B, T, 3, 3)
+                offs                              # (B, T, 3, 1)
+            )
+            world_offs = world_offs.squeeze(-1)  # now (B, T, 3)
+
+            # Position = parent_position + world_offset
+            positions[:, :, j] = positions[:, :, parent] + world_offs
+
+    return positions  # (B, T, 15, 3)

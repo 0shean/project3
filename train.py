@@ -26,12 +26,8 @@ from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 from torchvision.transforms import transforms
 
-from collections import defaultdict
-
-
-
-from models import BaseModel
-from losses import mpjpe, angle_loss, geodesic_loss, velocity_diff_loss
+from models import rot6d_to_rotmat
+from fk import compute_forward_kinematics
 
 
 def _log_loss_vals(loss_vals, writer, global_step, mode_prefix):
@@ -65,53 +61,28 @@ def _evaluate(net, data_loader, metrics_engine):
             # Get the predictions.
             model_out = net(batch_gpu)
 
+            pred6d = model_out['pred6d']  # (B,T,J*6)
+            B, T, J6 = pred6d.shape[0], pred6d.shape[1], pred6d.shape[2]
+            J = J6 // 6  # number of joints
+            # reshape to (B, T, J, 6)
+            pred6d_reshaped = pred6d.view(B, T, J, 6)
+            # use our rot6d_to_rotmat (imported) → yields (B, T, J, 3,3)
+            predR = rot6d_to_rotmat(pred6d_reshaped)
+            # now compute 3D joint positions via FK (imported compute_forward_kinematics)
+            pred_xyz = compute_forward_kinematics(predR)  # (B, T, J, 3)
+
+            # stash these into model_out so metrics_engine can pick them up
+            model_out['predictions'] = pred_xyz
+
             # Compute the loss.
-            pred_seq = model_out['predictions']  # (B,24,D)
-            # -------- loss on first predicted frame ----------------------------------
-            seed_len = net.config.seed_seq_len  # 20
-            tgt_len = net.config.target_seq_len  # 1
-
-            target_seq = batch_gpu.poses[:, seed_len:]  # (B,≥1,D)
-            pred_used = pred_seq
-            targ_used = target_seq
-
-            B, T, D = pred_used.shape
-            J = D // 9
-            pred_mat = pred_used.view(B, T, J, 3, 3)
-            targ_mat = targ_used.view(B, T, J, 3, 3)
-
-            loss_mpjpe = mpjpe(pred_used, targ_used)
-            loss_geo = geodesic_loss(pred_mat, targ_mat)
-
-
-            last_seed = batch_gpu.poses[:, seed_len - 1:seed_len]  # (B,1,D)
-            vel_pred = torch.cat([last_seed, pred_used], 1)
-            vel_targ = torch.cat([last_seed, targ_used], 1)
-            loss_vel = velocity_diff_loss(vel_pred, vel_targ)
-
-            from models import joint_angle_loss  # top-of-file import not needed
-            loss_jangle = joint_angle_loss(pred_mat, targ_mat, net.major_parents)
-
-            total_loss = (1.0 * loss_mpjpe +
-                          1.0 * loss_geo +
-                          0.25 * loss_vel +
-                          0.2 * loss_jangle)
-            loss_vals = {'mpjpe': loss_mpjpe.item(),
-                         'geodesic_loss': loss_geo.item(),
-                         'velocity_loss': loss_vel.item(),
-                         'joint_angle': loss_jangle.item(),
-                         'total_loss': total_loss.item()}
-
-            targets = target_seq  # NOT targ_used
-            metrics_engine.compute_and_aggregate(model_out['predictions'], target_seq)  # 24-frame GT
-
-
-            # -------------------------------------------------------------------------
+            loss_vals, targets = net.backward(batch_gpu, model_out)
 
             # Accumulate the loss and multiply with the batch size (because the last batch might have different size).
             for k in loss_vals:
                 loss_vals_agg[k] += loss_vals[k] * batch_gpu.batch_size
 
+            # Compute metrics.
+            metrics_engine.compute_and_aggregate(model_out['predictions'], targets)
 
             n_samples += batch_gpu.batch_size
 
@@ -163,9 +134,6 @@ def main(config):
     # Create the model.
     net = create_model(config)
     net.to(C.DEVICE)
-    print(f"Training on device: {C.DEVICE}")
-    print("CUDA available:", torch.cuda.is_available())
-    print("Using device:", C.DEVICE)
     print('Model created with {} trainable parameters'.format(U.count_parameters(net)))
 
     # Prepare metrics engine.
@@ -195,16 +163,12 @@ def main(config):
     writer = SummaryWriter(os.path.join(model_dir, 'logs'))
 
     # Define the optimizer.
-    optimizer = torch.optim.AdamW(net.parameters(), lr = config.lr, weight_decay = config.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
-
+    optimizer = optim.AdamW(net.parameters(), lr=config.lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
     # Training loop.
     global_step = 0
     best_valid_loss = float('inf')
     for epoch in range(config.n_epochs):
-
-        epoch_loss_sum = defaultdict(float)  # keyed by 'mpjpe', 'total_loss', …
-        epoch_samples = 0
 
         for i, abatch in enumerate(train_loader):
             start = time.time()
@@ -214,29 +178,32 @@ def main(config):
             batch_gpu = abatch.to_gpu()
 
             # Get the predictions.
-            model_out = net(batch_gpu)
+            model_out = net(batch_gpu, epoch=epoch)
+
+            pred6d = model_out['pred6d']  # (B,T,J*6)
+            B, T, J6 = pred6d.shape[0], pred6d.shape[1], pred6d.shape[2]
+            J = J6 // 6  # number of joints
+            # reshape to (B, T, J, 6)
+            pred6d_reshaped = pred6d.view(B, T, J, 6)
+            # use our rot6d_to_rotmat (imported) → yields (B, T, J, 3,3)
+            predR = rot6d_to_rotmat(pred6d_reshaped)
+            # now compute 3D joint positions via FK (imported compute_forward_kinematics)
+            pred_xyz = compute_forward_kinematics(predR)  # (B, T, J, 3)
+
+            # stash these into model_out so metrics_engine can pick them up
+            model_out['predictions'] = pred_xyz
 
             # Compute gradients.
             train_losses, targets = net.backward(batch_gpu, model_out)
 
-            bs = batch_gpu.batch_size
-            for k, v in train_losses.items():
-                epoch_loss_sum[k] += v * bs
-            epoch_samples += bs
-
-            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             # Update params.
             optimizer.step()
-
-            # store training step inside model for scheduled sampling
-            net.training_step = global_step
 
             elapsed = time.time() - start
 
             # Write training stats to Tensorboard.
             _log_loss_vals(train_losses, writer, global_step, 'train')
-            current_lr = optimizer.param_groups[0]['lr']
-            writer.add_scalar('lr', current_lr, global_step)
+            writer.add_scalar('lr', config.lr, global_step)
 
             if global_step % (config.print_every - 1) == 0:
                 loss_string = ' '.join(['{}: {:.6f}'.format(k, train_losses[k]) for k in train_losses])
@@ -279,16 +246,8 @@ def main(config):
 
                 # Make sure the model is in training mode again.
                 net.train()
-                scheduler.step(epoch + i / len(train_loader))
-            global_step += 1
 
-        # ── NEW: epoch-average log ────────────────────────────────────
-        epoch_loss_avg = {k: epoch_loss_sum[k] / epoch_samples for k in epoch_loss_sum}
-        # Console
-        avg_str = ' '.join(f'{k}: {v:.6f}' for k, v in epoch_loss_avg.items())
-        print(f'[EPOCH: {epoch + 1:03d}] AVERAGE: {avg_str}')
-        # TensorBoard
-        _log_loss_vals(epoch_loss_avg, writer, global_step, 'train_epoch_avg')
+            global_step += 1
 
     # After the training, evaluate the model on the test and generate the result file that can be uploaded to the
     # submission system. The submission file will be stored in the model directory.
