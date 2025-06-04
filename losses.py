@@ -4,8 +4,30 @@ Some loss functions.
 Copyright ETH Zurich, Manuel Kaufmann
 """
 import torch
-import torch.nn.functional as F
-from fk import compute_forward_kinematics
+
+
+# --- safe SO(3) log map ----------------------------------------------
+def mat_to_axis_angle(R, eps=1e-6):
+    """
+    R: (..., 3, 3) rotation matrices  (not necessarily perfect)
+    returns (..., 3) axis-angle vectors
+    """
+    cos = ((R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]) - 1) / 2
+    cos = cos.clamp(-1.0 + eps, 1.0 - eps)
+
+    angle = torch.acos(cos)                          # (...,)
+
+    # ‖sin‖ might be tiny when angle≈0 → avoid /0
+    sin = torch.sin(angle).clamp(min=eps)
+
+    # off-diagonal “vee” operator
+    vx = R[..., 2, 1] - R[..., 1, 2]
+    vy = R[..., 0, 2] - R[..., 2, 0]
+    vz = R[..., 1, 0] - R[..., 0, 1]
+    axis = torch.stack((vx, vy, vz), dim=-1) / (2 * sin.unsqueeze(-1))
+
+    return axis * angle.unsqueeze(-1)                # axis-angle
+
 
 def mse(predictions, targets):
     """
@@ -18,67 +40,32 @@ def mse(predictions, targets):
     loss_per_sample_and_seq = (diff * diff).sum(dim=-1)  # (N, F)
     return loss_per_sample_and_seq.mean()
 
-def mpjpe(pred_mats, targ_mats):
+def mpjpe(predict, target):
+    return torch.mean(torch.norm(predict - target, dim=-1))  # must return a torch.Tensor
+
+def angle_loss(predict, target):
+    cos_sim = (predict * target).sum(dim=-1) / (
+        predict.norm(dim=-1) * target.norm(dim=-1) + 1e-8)
+    return torch.mean(torch.acos(torch.clamp(cos_sim, -1.0, 1.0)))
+
+def geodesic_loss(pred_mat, targ_mat, eps=1e-7):
+    # pred_mat, targ_mat: [B, T, J, 3, 3]
+    R_err = pred_mat @ targ_mat.transpose(-1, -2)      # [B, T, J, 3, 3]
+    cos_theta = (R_err[..., 0, 0] + R_err[..., 1, 1] + R_err[..., 2, 2] - 1) / 2
+    cos_theta = cos_theta.clamp(-1 + eps, 1 - eps)
+    theta = torch.acos(cos_theta)
+    return theta.mean()
+
+def velocity_loss(seq):
+    vel = seq[:,1:] - seq[:,:-1]        # finite difference
+    return vel.abs().mean()
+
+def velocity_diff_loss(pred, targ):
     """
-    Mean Per-Joint Position Error (MPJPE).
-
-    Args:
-        pred_mats: Tensor of shape (B, T, J, 3, 3), predicted rotation matrices for each joint.
-        targ_mats: Tensor of shape (B, T, J, 3, 3), ground-truth rotation matrices.
-
-    Returns:
-        Scalar tensor: the average L2 distance between predicted and target joint positions over all batches, frames, and joints.
+    Finite-difference velocity L1 between pred & target.
+    pred, targ: [B, T, D] (rotation-mat or xyz)
     """
-    # Compute 3D joint positions via forward kinematics
-    # Assumes compute_forward_kinematics returns tensor of shape (B, T, J, 3)
-    pred_xyz = compute_forward_kinematics(pred_mats)
-    targ_xyz = compute_forward_kinematics(targ_mats)
-    # Compute L2 distance per joint
-    dist = torch.norm(pred_xyz - targ_xyz, dim=-1)  # shape: (B, T, J)
-    return torch.mean(dist)
+    v_pred = pred[:, 1:] - pred[:, :-1]
+    v_targ = targ[:, 1:] - targ[:, :-1]
+    return (v_pred - v_targ).abs().mean()
 
-
-def geodesic_loss(pred_mats, targ_mats, eps=1e-7):
-    """
-    Geodesic loss on SO(3): average rotation angle between predicted and target.
-
-    Args:
-        pred_mats: Tensor of shape (B, T, J, 3, 3).
-        targ_mats: Tensor of shape (B, T, J, 3, 3).
-        eps: small constant for numerical stability.
-
-    Returns:
-        Scalar tensor: average geodesic distance (radians).
-    """
-    # Relative rotation: R_rel = pred * targ^T
-    targ_transpose = targ_mats.transpose(-1, -2)
-    R_rel = torch.matmul(pred_mats, targ_transpose)  # (B, T, J, 3, 3)
-    # Compute trace
-    trace = R_rel[..., 0, 0] + R_rel[..., 1, 1] + R_rel[..., 2, 2]  # (B, T, J)
-    # Compute the angle via arccos((trace - 1)/2)
-    cos_theta = (trace - 1.0) / 2.0
-    cos_theta_clamped = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
-    theta = torch.acos(cos_theta_clamped)
-    return torch.mean(theta)
-
-
-def angle_loss(pred_mats, targ_mats, eps=1e-7):
-    """
-    Squared-angle loss: squares the geodesic distance on SO(3).
-
-    Args:
-        pred_mats: Tensor of shape (B, T, J, 3, 3).
-        targ_mats: Tensor of shape (B, T, J, 3, 3).
-        eps: small constant for numerical stability.
-
-    Returns:
-        Scalar tensor: average squared rotation angle.
-    """
-    # Relative rotation
-    targ_transpose = targ_mats.transpose(-1, -2)
-    R_rel = torch.matmul(pred_mats, targ_transpose)  # (B, T, J, 3, 3)
-    trace = R_rel[..., 0, 0] + R_rel[..., 1, 1] + R_rel[..., 2, 2]  # (B, T, J)
-    cos_theta = (trace - 1.0) / 2.0
-    cos_theta_clamped = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
-    theta = torch.acos(cos_theta_clamped)
-    return torch.mean(theta ** 2)
