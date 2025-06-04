@@ -286,7 +286,7 @@ def main(config):
         epoch_loss_avg = {k: epoch_loss_sum[k] / epoch_samples for k in epoch_loss_sum}
         # Console
         avg_str = ' '.join(f'{k}: {v:.6f}' for k, v in epoch_loss_avg.items())
-        print(f'[EPOCH {epoch + 1:03d}] AVERAGE {avg_str}')
+        print(f'[EPOCH: {epoch + 1:03d}] AVERAGE: {avg_str}')
         # TensorBoard
         _log_loss_vals(epoch_loss_avg, writer, global_step, 'train_epoch_avg')
 
