@@ -209,6 +209,7 @@ def main(config):
             batch_gpu = abatch.to_gpu()
 
             # Get the predictions.
+            net.training_step = global_step
             model_out = net(batch_gpu)
 
             # Compute gradients.
@@ -219,7 +220,7 @@ def main(config):
             optimizer.step()
 
             # store training step inside model for scheduled sampling
-            net.training_step = global_step
+
 
             elapsed = time.time() - start
 

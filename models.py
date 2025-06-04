@@ -185,10 +185,12 @@ class BaseModel(nn.Module):
             gate = torch.tanh(self.gate_fc(hidden))
             hidden = hidden + gate * motion_ctx
             delta = self.spl(hidden)
+            delta = delta.clamp(-0.5, 0.5)
             # ------------------------------------------------------------------
             # decide what to feed next: ground-truth vs. model prediction
             # ------------------------------------------------------------------
-            pred_frame = x_t + delta  # model’s proposal
+            x_t = x_t + delta
+            pred_frame = x_t# model’s proposal
 
             if self.training:
                 step = getattr(self, "training_step", 0)
@@ -201,7 +203,7 @@ class BaseModel(nn.Module):
                 x_t = mask * gt_frame + (1 - mask) * pred_frame
             else:
                 x_t = pred_frame
-            outputs.append(x_t)
+            outputs.append(pred_frame)
 
         pred_seq = torch.stack(outputs, dim=1)
 
