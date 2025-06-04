@@ -21,6 +21,31 @@ from fk import SMPL_JOINTS             # list[str] joint-name lookup
 from losses import mat_to_axis_angle
 
 
+def so3_log(R, eps=1e-6):
+    """
+    Log-map of a batch of rotation matrices.
+    R: (..., 3, 3)  torch tensor
+    Returns: (..., 3) axis-angle vector
+    """
+    trace = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    cos = (trace - 1) / 2
+    cos = cos.clamp(-1 + eps, 1 - eps)          # numerical safety
+    theta = torch.acos(cos)
+
+    # When sin(theta) is small use first-order expansion
+    sin_theta = torch.sin(theta)
+    mask = sin_theta.abs() < 1e-4
+    scale = torch.where(mask,
+                        0.5 + (theta**2)/12,     # series expansion
+                        theta / (2 * sin_theta))
+    # skew-symmetric part
+    w = torch.stack([R[..., 2, 1] - R[..., 1, 2],
+                     R[..., 0, 2] - R[..., 2, 0],
+                     R[..., 1, 0] - R[..., 0, 1]], dim=-1)
+    return scale.unsqueeze(-1) * w
+
+
+
 def create_model(config):
     # This is a helper function that can be useful if you have several model definitions that you want to
     # choose from via the command line. For now, we just return the Dummy model.
@@ -234,10 +259,8 @@ class BaseModel(nn.Module):
         loss_geo = geodesic_loss(pred_mat, targ_mat)
 
         # --- angle loss (axis-angle) ---
-        aa_pred = mat_to_axis_angle(pred_mat)  # (B, T, J, 3)
-        aa_targ = mat_to_axis_angle(targ_mat)
-        aa_pred = aa_pred.reshape(B, T, -1)  # flatten joint dim
-        aa_targ = aa_targ.reshape(B, T, -1)
+        aa_pred = so3_log(pred_mat).reshape(B, T, -1)
+        aa_targ = so3_log(targ_mat).reshape(B, T, -1)
         loss_ang = angle_loss(aa_pred, aa_targ)
 
         # --- velocity loss ---
