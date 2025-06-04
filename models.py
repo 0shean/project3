@@ -233,11 +233,11 @@ class BaseModel(nn.Module):
         J = len(self.major_parents)  # 15
 
         # ── convert 6-D → 3×3 matrices ────────────────────────────────────
-        pred_mat = rot6d_to_matrix(pred_short.view(B, T, J, 6))  # (B,T,J,3,3)
+        pred_mat = pred_short.view(B, T, J, 3, 3)
         targ_mat = targ_short.view(B, T, J, 3, 3)
 
         # also flatten matrices back to 9-D so legacy MPJPE / velocity code still works
-        pred_vec9 = pred_mat.reshape(B, T, J * 9)  # (B,12,135)
+        pred_vec9 = pred_short
 
         # ── losses ────────────────────────────────────────────────────────
         loss_jangle = joint_angle_loss(pred_mat, targ_mat, parents=self.major_parents)
