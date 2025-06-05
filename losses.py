@@ -69,3 +69,9 @@ def velocity_diff_loss(pred, targ):
     v_targ = targ[:, 1:] - targ[:, :-1]
     return (v_pred - v_targ).abs().mean()
 
+'''
+def create_model(config):
+    # This is a helper function that can be useful if you have several model definitions that you want to
+    # choose from via the command line. For now, we just return the Dummy model.
+    return GRUTCMotionForecast(config)
+''

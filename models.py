@@ -24,8 +24,8 @@ Usage
 -----
 ```python
 from gru_tc_model import GRUTCMotionForecast
-model = GRUTCMotionForecast(num_joints=22)
-pred = model(seed)  # seed shape: (B, 120, 22, 6)
+model = GRUTCMotionForecast(config)  # config must include input_dim, d_model, n_head, n_layer
+pred = model(seed)  # seed shape: (B, 120, J, 6)
 ```
 """
 from __future__ import annotations
@@ -36,10 +36,6 @@ import torch.nn.functional as F
 # ----------------------------------------------------------------------------
 #  Rotation representation helpers (6‑D rep; Zhou et al. 2019)
 # ----------------------------------------------------------------------------
-def create_model(config):
-    # This is a helper function that can be useful if you have several model definitions that you want to
-    # choose from via the command line. For now, we just return the Dummy model.
-    return GRUTCMotionForecast(config)
 def rot6d_to_matrix(x: torch.Tensor) -> torch.Tensor:
     """Convert 6‑D rotation rep to 3×3 matrix (B,*,3,3)."""
     a1, a2 = x[..., :3], x[..., 3:6]
@@ -48,11 +44,17 @@ def rot6d_to_matrix(x: torch.Tensor) -> torch.Tensor:
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack((b1, b2, b3), dim=-2)
 
+
 def matrix_to_rot6d(mat: torch.Tensor) -> torch.Tensor:
     """Inverse of rot6d_to_matrix.
     mat shape: (B,*,3,3) → returns (B,*,6)
     """
     return mat[..., :2, :].clone().reshape(*mat.shape[:-2], 6)
+
+def create_model(config):
+    # This is a helper function that can be useful if you have several model definitions that you want to
+    # choose from via the command line. For now, we just return the Dummy model.
+    return GRUTCMotionForecast(config)
 
 # ----------------------------------------------------------------------------
 #  Transformer context conditioner
@@ -71,8 +73,8 @@ class TransformerContext(nn.Module):
 
     def forward(self, seq: torch.Tensor) -> torch.Tensor:
         # seq shape: (B, T, D)
-        h = self.enc(seq)                  # (B, T, D)
-        ctx = h.mean(dim=1)               # (B, D)
+        h = self.enc(seq)                    # (B, T, D)
+        ctx = h.mean(dim=1)                  # (B, D)
         return self.proj_out(ctx)
 
 # ----------------------------------------------------------------------------
@@ -96,55 +98,59 @@ class GRUTCMotionForecast(nn.Module):
     """GRU decoder with a Transformer seed conditioner (einops‑free)."""
     def __init__(
         self,
-        num_joints: int = 22,
-        in_rot_dim: int = 6,
-        hidden_size: int = 512,
-        ctx_dim: int = 256,
-        nhead: int = 4,
-        nlayers: int = 2,
+        cfg: object,  # Configuration containing input_dim, d_model, n_head, n_layer
     ):
         super().__init__()
+        # Fixed 6-D rotation representation
+        in_rot_dim = 6
+        # Derive number of joints from input dimension (e.g., 135 = 22*6 + remainder)
+        num_joints = cfg.input_dim // in_rot_dim
+        hidden_size = cfg.d_model
+        ctx_dim = cfg.d_model
+        nhead = cfg.n_head
+        nlayers = cfg.n_layer
+
         self.num_joints = num_joints
         self.in_rot_dim = in_rot_dim
         # context conditioner
         self.ctx_net = TransformerContext(num_joints * in_rot_dim, nhead, nlayers)
-        # decoder
+        # decoder: input is (joint*6 + ctx_dim), hidden is hidden_size
         self.gru = nn.GRU(num_joints * in_rot_dim + ctx_dim, hidden_size, batch_first=True)
-        # output head
+        # output head: maps hidden_size → joint*6
         self.spl = SPLHead(hidden_size, num_joints, in_rot_dim)
 
     # ---------------------------------------------------------------------
     def forward(self, seed: torch.Tensor, future: int = 24) -> torch.Tensor:
-        """Predict `future` frames given 120‑frame `seed`.
-
-        Parameters
-        ----------
-        seed : Tensor, shape (B, 120, J, 6)
-        future : int, number of frames to forecast
-        """
+        """Predict `future` frames given `seed` of shape (B, T_seed, J, 6)."""
         B, T_seed, J, D = seed.shape  # D should be 6
         assert J == self.num_joints and D == self.in_rot_dim, "seed shape mismatch"
 
         # Flatten joints for the conditioner: (B, T, J*D)
         seq_flat = seed.reshape(B, T_seed, J * D)
-        ctx = self.ctx_net(seq_flat)              # (B, ctx_dim)
+        ctx = self.ctx_net(seq_flat)                # (B, ctx_dim)
 
-        # Prepare GRU hidden state
+        # Prepare initial hidden state
         h = torch.zeros(1, B, self.gru.hidden_size, device=seed.device, dtype=seed.dtype)
 
-        # Use last frame as the initial decoder input
-        inp = seed[:, -1].reshape(B, J * D)       # (B, J*D)
+        # Use last frame as initial decoder input
+        inp = seed[:, -1].reshape(B, J * D)         # (B, J*D)
         outputs = []
         for _ in range(future):
             # concat context every step
-            dec_in = torch.cat([inp, ctx], dim=-1).unsqueeze(1)  # (B,1, J*D+ctx)
-            out_t, h = self.gru(dec_in, h)                       # out_t: (B,1,H)
+            dec_in = torch.cat([inp, ctx], dim=-1).unsqueeze(1)  # (B,1, J*D + ctx_dim)
+            out_t, h = self.gru(dec_in, h)                       # out_t: (B,1,hidden_size)
             rot6d = self.spl(out_t.squeeze(1))                   # (B, J*D)
             outputs.append(rot6d)
             inp = rot6d                                          # autoregressive
 
-        pred = torch.stack(outputs, dim=1)                       # (B, F, J*D)
+        pred = torch.stack(outputs, dim=1)                       # (B, future, J*D)
         return pred.view(B, future, J, D)
+
+# ----------------------------------------------------------------------------
+#  Model creation helper
+# ----------------------------------------------------------------------------
+def create_model(config: object) -> GRUTCMotionForecast:
+    return GRUTCMotionForecast(config)
 
 # ----------------------------------------------------------------------------
 #  Quick sanity check (executed only when run as a script)
@@ -152,6 +158,13 @@ class GRUTCMotionForecast(nn.Module):
 if __name__ == "__main__":
     B, T, J = 2, 120, 22
     seed = torch.randn(B, T, J, 6)
-    model = GRUTCMotionForecast(num_joints=J)
+    # Dummy config with necessary fields
+    class Cfg: pass
+    cfg = Cfg()
+    cfg.input_dim = J * 6
+    cfg.d_model = 256
+    cfg.n_head = 4
+    cfg.n_layer = 2
+    model = GRUTCMotionForecast(cfg)
     out = model(seed, future=24)
     print("Output shape:", out.shape)  # should be (2, 24, 22, 6)
