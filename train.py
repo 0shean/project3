@@ -36,11 +36,11 @@ import losses as L
 class CurriculumNoiseScheduler:
     """Linearly increases Gaussian rotation noise σ from start → end over N steps."""
     def __init__(self, cfg):
-        # Now read the flat CLI flags instead of nested dict
-        self.start_std    = cfg.curriculum_start_std
-        self.end_std      = cfg.curriculum_end_std
-        self.total_steps  = cfg.curriculum_steps
-        self.global_step  = 0
+        # Read the flat CLI flags instead of a nested dict
+        self.start_std   = cfg.curriculum_start_std
+        self.end_std     = cfg.curriculum_end_std
+        self.total_steps = cfg.curriculum_steps
+        self.global_step = 0
 
     def add_noise(self, rot6d: torch.Tensor) -> torch.Tensor:
         if self.global_step >= self.total_steps:
@@ -151,7 +151,9 @@ def main(cfg: Configuration):
     # helpers
     cur_noise = CurriculumNoiseScheduler(cfg)
     metrics   = MetricsEngine(C.METRIC_TARGET_LENGTHS)
-    writer    = SummaryWriter(log_dir=U.create_model_dir(C.EXPERIMENT_DIR, int(time.time()), net.model_name()))
+    # Replace net.model_name() with a fixed string "gru_tc"
+    log_dir = U.create_model_dir(C.EXPERIMENT_DIR, int(time.time()), "gru_tc")
+    writer  = SummaryWriter(log_dir=log_dir)
 
     best_val    = float("inf")
     global_step = 0
@@ -215,20 +217,20 @@ def main(cfg: Configuration):
         writer.add_scalar("loss/valid", val_loss["total_loss"], epoch)
 
         # checkpoint ---------------------------------------------------
-        ckpt_path = writer.log_dir + "/model.pth"
+        ckpt_path = os.path.join(log_dir, "model.pth")
         if val_loss["total_loss"] < best_val:
             best_val = val_loss["total_loss"]
             torch.save({
-                "epoch":         epoch,
-                "model_state":   net.state_dict(),
-                "opt_state":     optimizer.state_dict(),
-                "cfg":           vars(cfg)
+                "epoch":       epoch,
+                "model_state": net.state_dict(),
+                "opt_state":   optimizer.state_dict(),
+                "cfg":         vars(cfg)
             }, ckpt_path)
         net.train()
 
     # ---------------------------------------------------------------
     print("Training finished. Evaluating test set…")
-    evaluate_test(Path(writer.log_dir).name.split("-")[0])
+    evaluate_test(Path(log_dir).name.split("-")[0])
 
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
