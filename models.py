@@ -135,7 +135,7 @@ class BaseModel(nn.Module):
         self.num_layers = config.num_layers       # e.g. 2
         self.pred_frames = config.output_n        # e.g. 24
 
-        self.ss_k = 1000
+        self.ss_k = 400
 
         # ─── core GRU ──────────────────────────────────────────────────────────
         self.gru = nn.GRU(
@@ -245,11 +245,11 @@ class BaseModel(nn.Module):
 
         # Weighting (joint‑angle loss weight lowered)
         total_loss = (
-                1.0 * loss_mpjpe
+                0.75 * loss_mpjpe
                 + 0.5 * loss_geo
                 + 0.5 * loss_vel
                 + 0.25 * loss_cont  # NEW
-                + 0.5 * loss_jangle
+                + 1 * loss_jangle
         )
 
         if do_backward:
