@@ -1,18 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-train_upgrade.py — cluster‑ready pipeline for the GRU‑TC model
-=============================================================
+train.py — cluster-ready pipeline for the GRU-TC model
+=====================================================
 
-• Uses the upgraded **GRU‑TC MotionForecastModel** (einops‑free)
-• Handles 6‑D rotations, bone‑length & joint‑limit penalties, PS‑KLD self‑distillation
-• Adds curriculum noise and a Transformer LR schedule (à la Vaswani 2017)
-• Invokes diffusion refinement after coarse prediction once warm‑up is over
-
-You can run this script exactly like the original `train.py`:
-
-    python train_upgrade.py --cfg configs/gru_tc.yaml
-
-All original dataset code (LMDBDataset, AMASSBatch, etc.) is reused.
+• Uses the upgraded **GRU-TC MotionForecastModel** (einops-free)
+• Handles 6-D rotations, bone-length & joint-limit penalties, PS-KLD self-distillation
+• Adds curriculum noise and a Transformer LR schedule (à la Vaswani 2017)
+• Invokes diffusion refinement after coarse prediction once warm-up is over
 """
 from __future__ import annotations
 import argparse, collections, glob, os, sys, time, math
@@ -42,17 +36,20 @@ import losses as L
 class CurriculumNoiseScheduler:
     """Linearly increases Gaussian rotation noise σ from start → end over N steps."""
     def __init__(self, cfg):
-        self.start_std = cfg.curriculum_noise["start_std"]
-        self.end_std   = cfg.curriculum_noise["end_std"]
-        self.steps     = cfg.curriculum_noise["steps"]
-        self.global_step = 0
+        # Now read the flat CLI flags instead of nested dict
+        self.start_std    = cfg.curriculum_start_std
+        self.end_std      = cfg.curriculum_end_std
+        self.total_steps  = cfg.curriculum_steps
+        self.global_step  = 0
+
     def add_noise(self, rot6d: torch.Tensor) -> torch.Tensor:
-        if self.global_step >= self.steps:
+        if self.global_step >= self.total_steps:
             return rot6d
-        t = self.global_step / self.steps
+        t = self.global_step / self.total_steps
         sigma = (1 - t) * self.start_std + t * self.end_std
         noise = torch.randn_like(rot6d) * sigma
         return rot6d + noise
+
     def step(self):
         self.global_step += 1
 
@@ -62,6 +59,7 @@ class TransformerLRScheduler(optim.lr_scheduler._LRScheduler):
         self.d_model = d_model
         self.warmup = warmup_steps
         super().__init__(optimizer, last_epoch)
+
     def get_lr(self):
         step = max(1, self.last_epoch + 1)
         scale = (self.d_model ** -0.5) * min(step ** -0.5, step * (self.warmup ** -1.5))
@@ -76,17 +74,26 @@ def build_dataloaders(cfg):
     valid_tf = transforms.Compose([ToTensor()])
     train_ds = LMDBDataset(os.path.join(C.DATA_DIR, "training"), transform=train_tf, filter_seq_len=win)
     valid_ds = LMDBDataset(os.path.join(C.DATA_DIR, "validation"), transform=valid_tf)
-    dl_train = DataLoader(train_ds, batch_size=cfg.bs_train, shuffle=True,
-                          num_workers=cfg.data_workers, collate_fn=AMASSBatch.from_sample_list)
-    dl_valid = DataLoader(valid_ds, batch_size=cfg.bs_eval, shuffle=False,
-                          num_workers=cfg.data_workers, collate_fn=AMASSBatch.from_sample_list)
+    dl_train = DataLoader(
+        train_ds,
+        batch_size=cfg.bs_train,
+        shuffle=True,
+        num_workers=cfg.data_workers,
+        collate_fn=AMASSBatch.from_sample_list
+    )
+    dl_valid = DataLoader(
+        valid_ds,
+        batch_size=cfg.bs_eval,
+        shuffle=False,
+        num_workers=cfg.data_workers,
+        collate_fn=AMASSBatch.from_sample_list
+    )
     return dl_train, dl_valid
 
 # full composite loss
-
 def compute_loss(model_out: Dict[str, torch.Tensor], batch, cfg):
-    pred = model_out["predictions"]              # [B,T,D]
-    target = batch.poses[:, cfg.seed_seq_len:]    # [B,T,D]
+    pred   = model_out["predictions"]                # [B, T, D]
+    target = batch.poses[:, cfg.seed_seq_len:]        # [B, T, D]
 
     B, T, D = pred.shape
     J = D // 9
@@ -98,19 +105,19 @@ def compute_loss(model_out: Dict[str, torch.Tensor], batch, cfg):
     loss_geo = L.geodesic_loss(pred_mat, targ_mat)
     loss_vel = L.velocity_diff_loss(pred, target)
 
-    # bone‑length & joint‑limit
-    loss_bone = L.bone_length_loss(pred_mat, targ_mat)
+    # bone-length & joint-limit
+    loss_bone  = L.bone_length_loss(pred_mat, targ_mat)
     loss_limit = L.joint_limit_loss(pred_mat)
 
-    # PS‑KLD self‑distillation (predict full 120 and compare spectra)
-    loss_ps = model_out["ps_kld"]  # already computed inside model forward()
+    # PS-KLD self-distillation (assumed computed inside model forward())
+    loss_ps = model_out.get("ps_kld", torch.tensor(0.0, device=pred.device))
 
     total = (
-        cfg.loss_weights["geodesic"] * loss_geo +
-        cfg.loss_weights["vel"]      * loss_vel +
-        cfg.loss_weights["bone"]     * loss_bone +
-        cfg.loss_weights["limit"]    * loss_limit +
-        cfg.loss_weights["pskld"]    * loss_ps
+        cfg.loss_geodesic * loss_geo +
+        cfg.loss_vel      * loss_vel +
+        cfg.loss_bone     * loss_bone +
+        cfg.loss_limit    * loss_limit +
+        cfg.loss_pskld    * loss_ps
     )
 
     return {
@@ -139,25 +146,26 @@ def main(cfg: Configuration):
 
     # opt + sched ------------------------------------------------------
     optimizer = optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = TransformerLRScheduler(optimizer, d_model=cfg.d_model, warmup_steps=4000)
+    scheduler = TransformerLRScheduler(optimizer, d_model=cfg.d_model, warmup_steps=cfg.lr_warmup_steps)
 
     # helpers
     cur_noise = CurriculumNoiseScheduler(cfg)
-    metrics = MetricsEngine(C.METRIC_TARGET_LENGTHS)
-    writer  = SummaryWriter(log_dir=U.create_model_dir(C.EXPERIMENT_DIR, int(time.time()), net.model_name()))
+    metrics   = MetricsEngine(C.METRIC_TARGET_LENGTHS)
+    writer    = SummaryWriter(log_dir=U.create_model_dir(C.EXPERIMENT_DIR, int(time.time()), net.model_name()))
 
-    best_val = float("inf")
+    best_val    = float("inf")
     global_step = 0
     net.train()
 
     for epoch in range(cfg.n_epochs):
         epoch_loss = collections.defaultdict(float)
-        nsmp = 0
+        nsmp       = 0
+
         for batch in dl_train:
             optimizer.zero_grad()
             batch_gpu = batch.to_gpu()
 
-            # curriculum noise on seed (in‑place)
+            # curriculum noise on seed (in-place)
             with torch.no_grad():
                 noisy_seed = cur_noise.add_noise(batch_gpu.poses[:, :cfg.seed_seq_len])
                 batch_gpu.poses[:, :cfg.seed_seq_len] = noisy_seed
@@ -168,36 +176,41 @@ def main(cfg: Configuration):
             loss_dict = compute_loss(model_out, batch_gpu, cfg)
             loss_dict["total_loss"].backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-            optimizer.step(); scheduler.step()
+            optimizer.step()
+            scheduler.step()
             net.training_step = global_step  # for scheduled sampling inside model
 
             # logging --------------------------------------------------
-            for k,v in loss_dict.items():
+            for k, v in loss_dict.items():
                 epoch_loss[k] += v.item() * batch_gpu.batch_size
             nsmp += batch_gpu.batch_size
+
             if global_step % cfg.print_every == 0:
                 writer.add_scalar("loss/train", loss_dict["total_loss"].item(), global_step)
                 writer.add_scalar("lr", optimizer.param_groups[0]["lr"], global_step)
 
             global_step += 1
 
-        # epoch‑level logging ------------------------------------------
-        avg_loss = {k: v/nsmp for k,v in epoch_loss.items()}
+        # epoch-level logging ------------------------------------------
+        avg_loss = {k: v / nsmp for k, v in epoch_loss.items()}
         print(f"[EPOCH {epoch+1:03d}] train total {avg_loss['total_loss']:.6f}")
 
         # ------- validation ------------------------------------------
-        net.eval(); metrics.reset()
-        val_loss = collections.defaultdict(float); vsamp=0
+        net.eval()
+        metrics.reset()
+        val_loss = collections.defaultdict(float)
+        vsamp    = 0
         with torch.no_grad():
             for batch in dl_valid:
                 batch_gpu = batch.to_gpu()
                 out = net(batch_gpu)
                 ldict = compute_loss(out, batch_gpu, cfg)
-                for k,v in ldict.items():
+                for k, v in ldict.items():
                     val_loss[k] += v.item() * batch_gpu.batch_size
                 vsamp += batch_gpu.batch_size
                 metrics.compute_and_aggregate(out["predictions"], batch_gpu.poses[:, cfg.seed_seq_len:])
-        val_loss = {k: v/vsamp for k,v in val_loss.items()}
+
+        val_loss = {k: v / vsamp for k, v in val_loss.items()}
         print(f"[EPOCH {epoch+1:03d}] valid total {val_loss['total_loss']:.6f}")
         writer.add_scalar("loss/valid", val_loss["total_loss"], epoch)
 
@@ -206,10 +219,10 @@ def main(cfg: Configuration):
         if val_loss["total_loss"] < best_val:
             best_val = val_loss["total_loss"]
             torch.save({
-                "epoch": epoch,
-                "model_state": net.state_dict(),
-                "opt_state": optimizer.state_dict(),
-                "cfg": cfg.to_dict()
+                "epoch":         epoch,
+                "model_state":   net.state_dict(),
+                "opt_state":     optimizer.state_dict(),
+                "cfg":           vars(cfg)
             }, ckpt_path)
         net.train()
 
