@@ -89,14 +89,10 @@ def _evaluate(net, data_loader, metrics_engine):
 
             from models import joint_angle_loss  # top-of-file import not needed
 
-            pred_mat = pred_mat[:, :, 1:]
-            targ_mat = targ_mat[:, :, 1:]
-            parents = net.major_parents[1:]
-
-            loss_jangle = joint_angle_loss(pred_mat, targ_mat, parents)
+            loss_jangle = joint_angle_loss(pred_mat, targ_mat, net.major_parents)
             loss_jangle_deg = loss_jangle * (180.0 / math.pi)
 
-            loss_bone = bone_length_loss(pred_mat, parents)
+            loss_bone = bone_length_loss(pred_mat, net.major_parents)
 
             total_loss = (
                     0.75 * loss_mpjpe

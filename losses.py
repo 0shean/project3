@@ -79,14 +79,17 @@ def local_to_global(rot_local, parents):
         (B, T, J, 3, 3) global rotation matrices
     """
     B, T, J, _, _ = rot_local.shape
+    assert len(parents) == J, f"Parent list length {len(parents)} does not match joint count {J}"
     glob = [None] * J
     for j in range(J):
         p = parents[j]
         if p == -1:
             glob[j] = rot_local[..., j, :, :]
         else:
+            assert glob[p] is not None, f"Parent index {p} not initialized before child {j}"
             glob[j] = torch.matmul(glob[p], rot_local[..., j, :, :])
     return torch.stack(glob, dim=2)
+
 
 def joint_angle_loss(pred_mat, targ_mat, parents, eps=1e-6):
     """
@@ -98,25 +101,34 @@ def joint_angle_loss(pred_mat, targ_mat, parents, eps=1e-6):
     Returns:
         scalar: average joint angle error (radians)
     """
-    parents = parents[1:]
+    # Remove root joint and remap parent indices
     pred_mat = pred_mat[:, :, 1:]
     targ_mat = targ_mat[:, :, 1:]
+    parents = parents[1:]
 
-    Rg_pred = local_to_global(pred_mat, parents)
-    Rg_targ = local_to_global(targ_mat, parents)
+    # Remap parent indices to new 0-based joint list
+    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(range(1, len(parents) + 1))}
+    remapped_parents = [old_to_new[p] if p in old_to_new else -1 for p in parents]
 
+    # Project predicted matrices to valid SO(3)
     u, _, v = torch.linalg.svd(pred_mat)
     pred_mat = torch.matmul(u, v.transpose(-1, -2))
 
-    R_err = torch.matmul(Rg_pred, Rg_targ.transpose(-1, -2))
+    # Compute global rotations
+    Rg_pred = local_to_global(pred_mat, remapped_parents)
+    Rg_targ = local_to_global(targ_mat, remapped_parents)
 
+    # Compute geodesic angle
+    R_err = torch.matmul(Rg_pred, Rg_targ.transpose(-1, -2))
     trace = R_err[..., 0, 0] + R_err[..., 1, 1] + R_err[..., 2, 2]
     cos = ((trace - 1) / 2).clamp(-1 + eps, 1 - eps)
     angle = torch.acos(cos)
     return angle.mean()
 
+
 def bone_length_loss(pred, parents):
     B, T, J, _, _ = pred.shape
+    assert len(parents) == J, f"Parent list length {len(parents)} does not match joint count {J}"
     diffs = []
     for j, p in enumerate(parents):
         if p == -1:
