@@ -70,7 +70,7 @@ class PoseTransformer(nn.Module):
         targ_mat = targ_mat[:, :, 1:]
         parents = self.major_parents[1:]
         loss_jangle = joint_angle_loss(pred_mat, targ_mat, parents=parents)
-        loss_bone = bone_length_loss(pred_mat, self.parents)
+        loss_bone = bone_length_loss(pred_mat, parents)
 
         total_loss = (
             0.75 * loss_mpjpe
