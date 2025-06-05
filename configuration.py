@@ -77,19 +77,19 @@ class Configuration(object):
         parser.add_argument('--lr_warmup_steps', type=int, default=4000,
                             help='Steps for Transformer LR warm-up.')
 
-        # Model architecture
-        parser.add_argument('--model', type=str, default='gru_tc', choices=['gru_tc'],
+        parser.add_argument('--model', type=str, default='gru_tc',
+                            choices=['gru_tc'],
                             help='Which model to train (must be "gru_tc").')
         parser.add_argument('--d_model', type=int, default=256,
-                            help='Transformer hidden dimension (e.g. 256).')
+                            help='Transformer hidden dimension.')
         parser.add_argument('--n_head', type=int, default=4,
                             help='Number of self-attention heads.')
         parser.add_argument('--n_layer', type=int, default=2,
                             help='Number of Transformer layers.')
         parser.add_argument('--dropout', type=float, default=0.1,
-                            help='Dropout for the Transformer context-conditioner.')
+                            help='Dropout for the Transformer.')
 
-        # Loss weights
+        # ─── Loss Weights ─────────────────────────────────────────────────────────
         parser.add_argument('--loss_geodesic', type=float, default=1.0,
                             help='Weight for geodesic loss.')
         parser.add_argument('--loss_vel', type=float, default=0.10,
@@ -99,21 +99,27 @@ class Configuration(object):
         parser.add_argument('--loss_limit', type=float, default=0.50,
                             help='Weight for joint-limit loss.')
         parser.add_argument('--loss_pskld', type=float, default=0.20,
-                            help='Weight for power-spectrum KLD self-distillation.')
+                            help='Weight for PS-KLD self-distillation.')
 
-        # Curriculum noise
+        # ─── Curriculum Noise ────────────────────────────────────────────────────
         parser.add_argument('--curriculum_start_std', type=float, default=0.05,
-                            help='Initial sigma for curriculum noise (radians).')
+                            help='Initial σ for curriculum noise (radians).')
         parser.add_argument('--curriculum_end_std', type=float, default=0.20,
-                            help='Final sigma for curriculum noise.')
+                            help='Final σ for curriculum noise.')
         parser.add_argument('--curriculum_steps', type=int, default=40000,
                             help='Number of training steps to ramp noise.')
 
-        # Diffusion refinement
+        # ─── Diffusion Refinement ────────────────────────────────────────────────
         parser.add_argument('--diffusion_steps', type=int, default=6,
                             help='Number of diffusion steps at inference.')
         parser.add_argument('--diffusion_warmup_epochs', type=int, default=10,
                             help='Epochs to wait before enabling diffusion.')
+
+        # ─── Miscellaneous (previously “unrecognized”) ────────────────────────────
+        parser.add_argument('--random_seed', type=int, default=None,
+                            help='Seed for RNG (optional).')
+        parser.add_argument('--output_n', type=int, default=None,
+                            help='(If still used) number of output frames. If using target_seq_len, you can ignore/drop this.')
 
         # Additional
         parser.add_argument('--input_dim', type=int, default=135,
