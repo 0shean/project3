@@ -74,4 +74,4 @@ def create_model(config):
     # This is a helper function that can be useful if you have several model definitions that you want to
     # choose from via the command line. For now, we just return the Dummy model.
     return GRUTCMotionForecast(config)
-''
+'''
