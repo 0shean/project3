@@ -32,6 +32,8 @@ import utils as U
 from models import GRUTCMotionForecast
 import losses as L
 
+from models import matrix_to_rot6d
+
 # ----------------------------------------------------------------------
 class CurriculumNoiseScheduler:
     """Linearly increases Gaussian rotation noise σ from start → end over N steps."""
@@ -174,9 +176,19 @@ def main(cfg: Configuration):
             cur_noise.step()
 
             # forward pass
-            seed = batch_gpu.poses[:, :cfg.seed_seq_len]  # (B, 120, J*6)
-            seed = seed.view(seed.size(0), cfg.seed_seq_len, -1, 6)  # (B,120,J,6)
-            model_out = net(seed)
+            from models import matrix_to_rot6d  # add near top of file
+
+            # 9-D → 6-D conversion
+            pose9 = batch_gpu.poses[:, :cfg.seed_seq_len]  # (B,120,J*9)
+            B, T, D = pose9.shape
+            J = D // 9
+            pose_mat = pose9.view(B, T, J, 3, 3)  # (B,120,J,3,3)
+            seed6d = matrix_to_rot6d(pose_mat.reshape(-1, 3, 3))  # (B*120*J,6)
+            seed6d = seed6d.view(B, T, J, 6)  # (B,120,J,6)
+
+            model_out = net(seed6d)
+
+
             loss_dict = compute_loss(model_out, batch_gpu, cfg)
             loss_dict["total_loss"].backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
