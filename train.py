@@ -174,7 +174,9 @@ def main(cfg: Configuration):
             cur_noise.step()
 
             # forward pass
-            model_out = net(batch_gpu)
+            seed = batch_gpu.poses[:, :cfg.seed_seq_len]  # (B, 120, J*6)
+            seed = seed.view(seed.size(0), cfg.seed_seq_len, -1, 6)  # (B,120,J,6)
+            model_out = net(seed)
             loss_dict = compute_loss(model_out, batch_gpu, cfg)
             loss_dict["total_loss"].backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
