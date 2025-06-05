@@ -19,7 +19,7 @@ class PoseTransformer(nn.Module):
         self.input_size = config.input_dim
         self.hidden_size = config.hidden_size
         self.pred_frames = config.output_n
-        self.ss_k = 400
+        self.ss_k = 600
 
         self.encoder = nn.Linear(self.input_size, self.hidden_size)
         self.transformer = nn.Transformer(  # simple encoder-decoder style
@@ -61,10 +61,15 @@ class PoseTransformer(nn.Module):
         pred_mat = pred_seq.view(B, T, J, 3, 3)
         targ_mat = target_seq.view(B, T, J, 3, 3)
 
-        loss_jangle = joint_angle_loss(pred_mat, targ_mat, parents=self.major_parents)
+
         loss_mpjpe = mpjpe(pred_seq, target_seq)
         loss_geo = geodesic_loss(pred_mat, targ_mat)
         loss_vel = velocity_diff_loss(pred_seq, target_seq)
+
+        pred_mat = pred_mat[:, :, 1:]
+        targ_mat = targ_mat[:, :, 1:]
+        parents = self.major_parents[1:]
+        loss_jangle = joint_angle_loss(pred_mat, targ_mat, parents=self.major_parents)
         loss_bone = bone_length_loss(pred_mat, self.major_parents)
 
         total_loss = (

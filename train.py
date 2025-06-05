@@ -13,6 +13,7 @@ import torch
 import torch.optim as optim
 import utils as U
 from models import create_model
+import math
 
 from configuration import Configuration
 from configuration import CONSTANTS as C
@@ -88,6 +89,8 @@ def _evaluate(net, data_loader, metrics_engine):
 
             from models import joint_angle_loss  # top-of-file import not needed
             loss_jangle = joint_angle_loss(pred_mat, targ_mat, net.major_parents)
+            loss_jangle_deg = loss_jangle * (180.0 / math.pi)
+
             loss_bone = bone_length_loss(pred_mat, net.major_parents)
 
             total_loss = (
@@ -101,7 +104,7 @@ def _evaluate(net, data_loader, metrics_engine):
             loss_vals = {'mpjpe': loss_mpjpe.item(),
                          'geodesic_loss': loss_geo.item(),
                          'velocity_loss': loss_vel.item(),
-                         'joint_angle': loss_jangle.item(),
+                         'joint_angle': loss_jangle_deg.item(),
                          'bone_loss:': loss_bone.item(),
                          'total_loss': total_loss.item()}
 
