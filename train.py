@@ -12,6 +12,7 @@ import time
 import torch
 import torch.optim as optim
 import utils as U
+from models import create_model
 
 from configuration import Configuration
 from configuration import CONSTANTS as C
@@ -20,7 +21,6 @@ from data import LMDBDataset
 from data_transforms import ExtractWindow
 from data_transforms import ToTensor
 from evaluate import evaluate_test
-from models import create_model
 from motion_metrics import MetricsEngine
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
@@ -28,8 +28,7 @@ from torchvision.transforms import transforms
 
 
 
-from models import BaseModel
-from losses import mpjpe, angle_loss, geodesic_loss, velocity_diff_loss
+from losses import mpjpe, angle_loss, geodesic_loss, velocity_diff_loss, bone_length_loss
 
 
 def _log_loss_vals(loss_vals, writer, global_step, mode_prefix):
@@ -89,15 +88,21 @@ def _evaluate(net, data_loader, metrics_engine):
 
             from models import joint_angle_loss  # top-of-file import not needed
             loss_jangle = joint_angle_loss(pred_mat, targ_mat, net.major_parents)
+            loss_bone = bone_length_loss(pred_mat, net.major_parents)
 
-            total_loss = (1.0 * loss_mpjpe +
-                          1.0 * loss_geo +
-                          0.25 * loss_vel +
-                          0.2 * loss_jangle)
+            total_loss = (
+                    0.75 * loss_mpjpe
+                    + 0.5 * loss_geo
+                    + 0.5 * loss_vel
+                    + 1.0 * loss_jangle
+                    + 0.3 * loss_bone
+            )
+
             loss_vals = {'mpjpe': loss_mpjpe.item(),
                          'geodesic_loss': loss_geo.item(),
                          'velocity_loss': loss_vel.item(),
                          'joint_angle': loss_jangle.item(),
+                         'bone_loss:': loss_bone.item(),
                          'total_loss': total_loss.item()}
 
             targets = target_seq  # NOT targ_used

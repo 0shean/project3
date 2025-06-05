@@ -69,3 +69,54 @@ def velocity_diff_loss(pred, targ):
     v_targ = targ[:, 1:] - targ[:, :-1]
     return (v_pred - v_targ).abs().mean()
 
+def local_to_global(rot_local, parents):
+    """
+    Converts local joint rotations to global rotations using the kinematic chain.
+    Args:
+        rot_local: (B, T, J, 3, 3) rotation matrices in local frame
+        parents: list of int, where -1 indicates root joint
+    Returns:
+        (B, T, J, 3, 3) global rotation matrices
+    """
+    B, T, J, _, _ = rot_local.shape
+    glob = [None] * J
+    for j in range(J):
+        p = parents[j]
+        if p == -1:
+            glob[j] = rot_local[..., j, :, :]
+        else:
+            glob[j] = torch.matmul(glob[p], rot_local[..., j, :, :])
+    return torch.stack(glob, dim=2)
+
+def joint_angle_loss(pred_mat, targ_mat, parents, eps=1e-6):
+    """
+    Computes mean angular error (in radians) between predicted and ground-truth joint rotations.
+    Args:
+        pred_mat: (B, T, J, 3, 3) predicted rotation matrices
+        targ_mat: (B, T, J, 3, 3) ground-truth rotation matrices
+        parents: list[int] of joint parent indices
+    Returns:
+        scalar: average joint angle error (radians)
+    """
+    Rg_pred = local_to_global(pred_mat, parents)
+    Rg_targ = local_to_global(targ_mat, parents)
+    R_err = torch.matmul(Rg_pred, Rg_targ.transpose(-1, -2))
+
+    trace = R_err[..., 0, 0] + R_err[..., 1, 1] + R_err[..., 2, 2]
+    cos = ((trace - 1) / 2).clamp(-1 + eps, 1 - eps)
+    angle = torch.acos(cos)
+    return angle.mean()
+
+def bone_length_loss(pred, parents):
+    B, T, J, _, _ = pred.shape
+    diffs = []
+    for j, p in enumerate(parents):
+        if p == -1:
+            continue
+        pred_j = pred[..., j, :, 2]  # z-axis
+        pred_p = pred[..., p, :, 2]
+        dist = (pred_j - pred_p).norm(dim=-1)
+        diffs.append(dist)
+    diffs = torch.stack(diffs, dim=-1)
+    diffs_var = diffs.var(dim=-1).mean()  # variance across joints
+    return diffs_var
