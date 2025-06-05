@@ -66,11 +66,11 @@ class PoseTransformer(nn.Module):
         loss_geo = geodesic_loss(pred_mat, targ_mat)
         loss_vel = velocity_diff_loss(pred_seq, target_seq)
 
-        pred_mat = pred_mat[:, :, 1:]
-        targ_mat = targ_mat[:, :, 1:]
-        parents = self.major_parents[1:]
-        loss_jangle = joint_angle_loss(pred_mat, targ_mat, parents=parents)
-        loss_bone = bone_length_loss(pred_mat, parents)
+        # Let joint_angle_loss() handle removing the root and remapping parents internally:
+        loss_jangle = joint_angle_loss(pred_mat, targ_mat, parents=self.major_parents)
+        # If bone_length_loss should exclude root as well, you can pass the same self.major_parents
+        # (it will slice and remap internally if you adapt it similarly).
+        loss_bone = bone_length_loss(pred_mat, parents=self.major_parents)
 
         total_loss = (
             0.75 * loss_mpjpe

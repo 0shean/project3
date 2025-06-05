@@ -79,13 +79,14 @@ def local_to_global(rot_local, parents):
         (B, T, J, 3, 3) global rotation matrices
     """
     B, T, J, _, _ = rot_local.shape
-    assert len(parents) == J, f"Parent list length {len(parents)} does not match joint count {J}"
+    assert len(parents) == J, f"Parent list length {len(parents)} must match joint count {J}"
     glob = [None] * J
     for j in range(J):
         p = parents[j]
         if p == -1:
             glob[j] = rot_local[..., j, :, :]
         else:
+            # By construction, glob[p] has already been set because p < j in a valid kinematic tree
             assert glob[p] is not None, f"Parent index {p} not initialized before child {j}"
             glob[j] = torch.matmul(glob[p], rot_local[..., j, :, :])
     return torch.stack(glob, dim=2)
@@ -94,53 +95,74 @@ def local_to_global(rot_local, parents):
 def joint_angle_loss(pred_mat, targ_mat, parents, eps=1e-6):
     """
     Computes mean angular error (in radians) between predicted and ground-truth joint rotations.
-    Excludes root joint and remaps parent indices.
+    Excludes the root joint and remaps parent indices accordingly.
+    Args:
+        pred_mat: (B, T, J, 3, 3) predicted rotation matrices (including root)
+        targ_mat: (B, T, J, 3, 3) ground-truth rotation matrices (including root)
+        parents: list[int] of length J, where -1 indicates root joint
+    Returns:
+        scalar: average joint angle error (radians)
     """
-    # Remove root joint
-    kept_joints = list(range(1, len(parents)))  # original joint indices kept
-    pred_mat = pred_mat[:, :, 1:]
-    targ_mat = targ_mat[:, :, 1:]
+    # 1) Remove root joint (index 0) from both prediction and target
+    pred_mat = pred_mat[:, :, 1:]   # now shape (B, T, J-1, 3, 3)
+    targ_mat = targ_mat[:, :, 1:]   # same shape
+    kept_parents = parents[1:]      # length J-1
 
-    # Map from old joint index → new index (after slicing)
-    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(kept_joints)}
+    # 2) Build a map old_index → new_index after slicing out root.
+    #    Original joints were [0, 1, 2, ..., J-1]. After removing 0, the new indices are [0←1, 1←2, …].
+    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(range(1, len(parents)))}
 
-    # Remap parents
+    # 3) Remap each parent to the new index, or -1 if parent was root or not in kept range.
     remapped_parents = []
-    for j in kept_joints:
-        p = parents[j]
-        if p == -1 or p not in old_to_new:
+    for old_p in kept_parents:
+        if old_p == -1 or old_p not in old_to_new:
             remapped_parents.append(-1)
         else:
-            remapped_parents.append(old_to_new[p])
+            remapped_parents.append(old_to_new[old_p])
+    # Now remapped_parents has length J-1, and each entry is in [-1..(J-2)].
 
-    # Project to SO(3)
+    # 4) (Optional but recommended) Project pred_mat into SO(3) to ensure valid rotations.
+    #    Compute SVD per joint, then reconstruct: R_closest = U @ Vᵀ
     u, _, v = torch.linalg.svd(pred_mat)
     pred_mat = torch.matmul(u, v.transpose(-1, -2))
 
-    # Global rotations
+    # 5) Compute global rotations for both pred and target using the remapped parents.
     Rg_pred = local_to_global(pred_mat, remapped_parents)
     Rg_targ = local_to_global(targ_mat, remapped_parents)
 
-    # Geodesic angle
+    # 6) Compute the geodesic angle between Rg_pred and Rg_targ at each joint:
+    #    R_err = Rg_pred @ Rg_targᵀ, then angle = arccos((trace(R_err) - 1) / 2).
     R_err = torch.matmul(Rg_pred, Rg_targ.transpose(-1, -2))
     trace = R_err[..., 0, 0] + R_err[..., 1, 1] + R_err[..., 2, 2]
     cos = ((trace - 1) / 2).clamp(-1 + eps, 1 - eps)
     angle = torch.acos(cos)
+
+    # 7) Return mean over batch, time, and joints (in radians).
     return angle.mean()
 
 
-
 def bone_length_loss(pred, parents):
+    """
+    Penalizes variance in bone lengths (distance between each child joint and its parent) across joints.
+    Args:
+        pred: (B, T, J, 3, 3) predicted rotation matrices (global or local)
+        parents: list[int] of length J, where -1 indicates root joint
+    Returns:
+        scalar: mean variance of bone lengths across the batch and time
+    """
     B, T, J, _, _ = pred.shape
-    assert len(parents) == J, f"Parent list length {len(parents)} does not match joint count {J}"
+    assert len(parents) == J, f"Parent list length {len(parents)} must match joint count {J}"
+
     diffs = []
     for j, p in enumerate(parents):
         if p == -1:
             continue
-        pred_j = pred[..., j, :, 2]  # z-axis
-        pred_p = pred[..., p, :, 2]
-        dist = (pred_j - pred_p).norm(dim=-1)
+        # Use the z-axis of each joint’s rotation matrix as a proxy for joint position
+        pred_j = pred[..., j, :, 2]   # shape (B, T)
+        pred_p = pred[..., p, :, 2]   # shape (B, T)
+        dist = (pred_j - pred_p).norm(dim=-1)  # L2 distance (B, T)
         diffs.append(dist)
-    diffs = torch.stack(diffs, dim=-1)
-    diffs_var = diffs.var(dim=-1).mean()  # variance across joints
+    diffs = torch.stack(diffs, dim=-1)  # shape (B, T, num_bones)
+    diffs_var = diffs.var(dim=-1).mean()  # var across bones → shape (B, T), then mean over B,T
     return diffs_var
+
