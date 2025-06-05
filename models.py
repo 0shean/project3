@@ -36,7 +36,10 @@ import torch.nn.functional as F
 # ----------------------------------------------------------------------------
 #  Rotation representation helpers (6‑D rep; Zhou et al. 2019)
 # ----------------------------------------------------------------------------
-
+def create_model(config):
+    # This is a helper function that can be useful if you have several model definitions that you want to
+    # choose from via the command line. For now, we just return the Dummy model.
+    return GRUTCMotionForecast(config)
 def rot6d_to_matrix(x: torch.Tensor) -> torch.Tensor:
     """Convert 6‑D rotation rep to 3×3 matrix (B,*,3,3)."""
     a1, a2 = x[..., :3], x[..., 3:6]
