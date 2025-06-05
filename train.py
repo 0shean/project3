@@ -1,251 +1,187 @@
 # -*- coding: utf-8 -*-
 """
-train.py — cluster-ready pipeline for the GRU-TC model
-=====================================================
+GRU‑TC Motion Forecast Model  (einops‑free)
+==========================================
 
-• Uses the upgraded **GRU-TC MotionForecastModel** (einops-free)
-• Handles 6-D rotations, bone-length & joint-limit penalties, PS-KLD self-distillation
-• Adds curriculum noise and a Transformer LR schedule (à la Vaswani 2017)
-• Invokes diffusion refinement after coarse prediction once warm-up is over
+This version removes all einops dependencies by replacing tensor rearrangements
+with native PyTorch `view`, `reshape`, and `permute` calls.  It is therefore
+compatible with the course cluster environment where additional site‑packages
+cannot be installed.
+
+Key components
+--------------
+* **TransformerContext** – encodes the 120‑frame seed once and produces a
+  fixed‑length context vector using `nn.TransformerEncoder` (batch_first=True
+  so no external rearrange is needed).
+* **GRUTCMotionForecast** – GRU decoder that receives the context vector at
+  every step.
+* **SPLHead** – lightweight structured prediction layer emitting 6‑D rotation
+  vectors for each joint.
+* **rot6d_to_matrix / matrix_to_rot6d** – minimal SO(3) helpers (copied here to
+  avoid extra imports).
+
+Usage
+-----
+```python
+from gru_tc_model import GRUTCMotionForecast
+model = GRUTCMotionForecast(config)  # config must include input_dim, d_model, n_head, n_layer
+pred = model(seed)  # seed shape: (B, 120, J, 6)
+```
 """
 from __future__ import annotations
-import argparse, collections, glob, os, sys, time, math
-from pathlib import Path
-from typing import Dict
-
-import numpy as np
 import torch
-from torch import nn, optim
-from torch.utils.data import DataLoader
-from torchvision.transforms import transforms
-from tensorboardX import SummaryWriter
+import torch.nn as nn
+import torch.nn.functional as F
 
-# -- project modules ---------------------------------------------------
-from configuration import Configuration, CONSTANTS as C
-from data import LMDBDataset, AMASSBatch
-from data_transforms import ExtractWindow, ToTensor
-from evaluate import evaluate_test
-from motion_metrics import MetricsEngine
-import utils as U
+# ----------------------------------------------------------------------------
+#  Rotation representation helpers (6‑D rep; Zhou et al. 2019)
+# ----------------------------------------------------------------------------
+def rot6d_to_matrix(x: torch.Tensor) -> torch.Tensor:
+    """Convert 6‑D rotation rep to 3×3 matrix (B,*,3,3)."""
+    a1, a2 = x[..., :3], x[..., 3:6]
+    b1 = F.normalize(a1, dim=-1)
+    b2 = F.normalize(a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack((b1, b2, b3), dim=-2)
 
-# upgraded model + losses
-from models import GRUTCMotionForecast
-import losses as L
 
-from models import matrix_to_rot6d
+def matrix_to_rot6d(mat: torch.Tensor) -> torch.Tensor:
+    """Inverse of rot6d_to_matrix.
+    mat shape: (B,*,3,3) → returns (B,*,6)
+    """
+    return mat[..., :2, :].clone().reshape(*mat.shape[:-2], 6)
 
-# ----------------------------------------------------------------------
-class CurriculumNoiseScheduler:
-    """Linearly increases Gaussian rotation noise σ from start → end over N steps."""
+# ----------------------------------------------------------------------------
+#  Transformer context conditioner
+# ----------------------------------------------------------------------------
+class TransformerContext(nn.Module):
+    def __init__(self, embed_dim: int, nhead: int, nlayers: int):
+        super().__init__()
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=nhead,
+            dim_feedforward=embed_dim * 4,
+            batch_first=True,
+        )
+        self.enc = nn.TransformerEncoder(enc_layer, nlayers)
+        self.proj_out = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, seq: torch.Tensor) -> torch.Tensor:
+        # seq shape: (B, T, D)
+        h = self.enc(seq)                    # (B, T, D)
+        ctx = h.mean(dim=1)                  # (B, D)
+        return self.proj_out(ctx)
+
+# ----------------------------------------------------------------------------
+#  Structured Prediction Layer (minimal; can be swapped for your own SPL)
+# ----------------------------------------------------------------------------
+class SPLHead(nn.Module):
+    def __init__(self, in_dim: int, num_joints: int, out_dim_per_joint: int):
+        super().__init__()
+        self.fc = nn.Linear(in_dim, num_joints * out_dim_per_joint)
+        self.num_joints = num_joints
+        self.out_dim = out_dim_per_joint
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, H)
+        return self.fc(x)
+
+# ----------------------------------------------------------------------------
+#  Main model
+# ----------------------------------------------------------------------------
+class GRUTCMotionForecast(nn.Module):
+    """GRU decoder with a Transformer seed conditioner (einops‑free)."""
     def __init__(self, cfg):
-        # Read the flat CLI flags instead of a nested dict
-        self.start_std   = cfg.curriculum_start_std
-        self.end_std     = cfg.curriculum_end_std
-        self.total_steps = cfg.curriculum_steps
-        self.global_step = 0
+        super().__init__()
+        self.cfg = cfg
 
-    def add_noise(self, rot6d: torch.Tensor) -> torch.Tensor:
-        if self.global_step >= self.total_steps:
-            return rot6d
-        t = self.global_step / self.total_steps
-        sigma = (1 - t) * self.start_std + t * self.end_std
-        noise = torch.randn_like(rot6d) * sigma
-        return rot6d + noise
+        # Dataset uses 9‑D (3×3) per joint → derive joint count from that
+        self.in_rot_dim = 6                                         # we output 6‑D
+        self.num_joints = cfg.input_dim // 9                        # e.g. 135 → 15 joints
 
-    def step(self):
-        self.global_step += 1
+        embed_dim   = self.num_joints * self.in_rot_dim             # 15 × 6 = 90
+        nhead       = cfg.n_head
+        nlayers     = cfg.n_layer
+        ctx_dim     = cfg.d_model                                   # projected context + GRU hidden size
+        hidden_size = ctx_dim
 
-class TransformerLRScheduler(optim.lr_scheduler._LRScheduler):
-    """d_model^-0.5 * min(step^-0.5, step * warmup^-1.5)"""
-    def __init__(self, optimizer, d_model: int, warmup_steps: int = 4000, last_epoch: int = -1):
-        self.d_model = d_model
-        self.warmup = warmup_steps
-        super().__init__(optimizer, last_epoch)
+        # context conditioner
+        self.ctx_net = TransformerContext(embed_dim, nhead, nlayers)
+        self.proj_ctx = nn.Linear(embed_dim, ctx_dim)
 
-    def get_lr(self):
-        step = max(1, self.last_epoch + 1)
-        scale = (self.d_model ** -0.5) * min(step ** -0.5, step * (self.warmup ** -1.5))
-        return [base_lr * scale for base_lr in self.base_lrs]
+        # decoder
+        self.gru = nn.GRU(embed_dim + ctx_dim, hidden_size, batch_first=True)
+        # output head
+        self.spl = SPLHead(hidden_size, self.num_joints, self.in_rot_dim)
+(
+        self,
+        cfg: object,  # Configuration containing input_dim, d_model, n_head, n_layer
+    ):
+        super().__init__()
+        # Fixed 6-D rotation representation
+        in_rot_dim = 6
+        # Derive number of joints from input dimension (e.g., 135 = 22*6 + remainder)
+        num_joints = cfg.input_dim // in_rot_dim
+        hidden_size = cfg.d_model
+        ctx_dim = cfg.d_model
+        nhead = cfg.n_head
+        nlayers = cfg.n_layer
 
-# ----------------------------------------------------------------------
+        self.num_joints = num_joints
+        self.in_rot_dim = in_rot_dim
+        # context conditioner
+        self.ctx_net = TransformerContext(num_joints * in_rot_dim, nhead, nlayers)
+        # decoder: input is (joint*6 + ctx_dim), hidden is hidden_size
+        self.gru = nn.GRU(num_joints * in_rot_dim + ctx_dim, hidden_size, batch_first=True)
+        # output head: maps hidden_size → joint*6
+        self.spl = SPLHead(hidden_size, num_joints, in_rot_dim)
 
-def build_dataloaders(cfg):
-    rng = np.random.RandomState(4313)
-    win = cfg.seed_seq_len + cfg.target_seq_len
-    train_tf = transforms.Compose([ExtractWindow(win, rng, mode="random"), ToTensor()])
-    valid_tf = transforms.Compose([ToTensor()])
-    train_ds = LMDBDataset(os.path.join(C.DATA_DIR, "training"), transform=train_tf, filter_seq_len=win)
-    valid_ds = LMDBDataset(os.path.join(C.DATA_DIR, "validation"), transform=valid_tf)
-    dl_train = DataLoader(
-        train_ds,
-        batch_size=cfg.bs_train,
-        shuffle=True,
-        num_workers=cfg.data_workers,
-        collate_fn=AMASSBatch.from_sample_list
-    )
-    dl_valid = DataLoader(
-        valid_ds,
-        batch_size=cfg.bs_eval,
-        shuffle=False,
-        num_workers=cfg.data_workers,
-        collate_fn=AMASSBatch.from_sample_list
-    )
-    return dl_train, dl_valid
+    # ---------------------------------------------------------------------
+    def forward(self, seed: torch.Tensor, future: int = 24) -> torch.Tensor:
+        """Predict `future` frames given `seed` of shape (B, T_seed, J, 6)."""
+        B, T_seed, J, D = seed.shape  # D should be 6
+        assert J == self.num_joints and D == self.in_rot_dim, "seed shape mismatch"
 
-# full composite loss
-def compute_loss(model_out: Dict[str, torch.Tensor], batch, cfg):
-    pred   = model_out["predictions"]                # [B, T, D]
-    target = batch.poses[:, cfg.seed_seq_len:]        # [B, T, D]
+        # Flatten joints for the conditioner: (B, T, J*D)
+        seq_flat = seed.reshape(B, T_seed, J * D)
+        ctx = self.ctx_net(seq_flat)                # (B, ctx_dim)
 
-    B, T, D = pred.shape
-    J = D // 9
+        # Prepare initial hidden state
+        h = torch.zeros(1, B, self.gru.hidden_size, device=seed.device, dtype=seed.dtype)
 
-    pred_mat = pred.view(B, T, J, 3, 3)
-    targ_mat = target.view(B, T, J, 3, 3)
+        # Use last frame as initial decoder input
+        inp = seed[:, -1].reshape(B, J * D)         # (B, J*D)
+        outputs = []
+        for _ in range(future):
+            # concat context every step
+            dec_in = torch.cat([inp, ctx], dim=-1).unsqueeze(1)  # (B,1, J*D + ctx_dim)
+            out_t, h = self.gru(dec_in, h)                       # out_t: (B,1,hidden_size)
+            rot6d = self.spl(out_t.squeeze(1))                   # (B, J*D)
+            outputs.append(rot6d)
+            inp = rot6d                                          # autoregressive
 
-    # basic losses
-    loss_geo = L.geodesic_loss(pred_mat, targ_mat)
-    loss_vel = L.velocity_diff_loss(pred, target)
+        pred = torch.stack(outputs, dim=1)                       # (B, future, J*D)
+        return pred.view(B, future, J, D)
 
-    # bone-length & joint-limit
-    loss_bone  = L.bone_length_loss(pred_mat, targ_mat)
-    loss_limit = L.joint_limit_loss(pred_mat)
+# ----------------------------------------------------------------------------
+#  Model creation helper
+# ----------------------------------------------------------------------------
+def create_model(config: object) -> GRUTCMotionForecast:
+    return GRUTCMotionForecast(config)
 
-    # PS-KLD self-distillation (assumed computed inside model forward())
-    loss_ps = model_out.get("ps_kld", torch.tensor(0.0, device=pred.device))
-
-    total = (
-        cfg.loss_geodesic * loss_geo +
-        cfg.loss_vel      * loss_vel +
-        cfg.loss_bone     * loss_bone +
-        cfg.loss_limit    * loss_limit +
-        cfg.loss_pskld    * loss_ps
-    )
-
-    return {
-        "total_loss": total,
-        "geodesic":   loss_geo.detach(),
-        "velocity":   loss_vel.detach(),
-        "bone":       loss_bone.detach(),
-        "limit":      loss_limit.detach(),
-        "pskld":      loss_ps.detach()
-    }
-
-# ----------------------------------------------------------------------
-
-def main(cfg: Configuration):
-    if cfg.seed is None:
-        cfg.seed = int(time.time())
-    torch.manual_seed(cfg.seed)
-
-    # dataloaders
-    dl_train, dl_valid = build_dataloaders(cfg)
-
-    # model ------------------------------------------------------------
-    net = GRUTCMotionForecast(cfg)
-    net.to(C.DEVICE)
-    print("Params:", U.count_parameters(net))
-
-    # opt + sched ------------------------------------------------------
-    optimizer = optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = TransformerLRScheduler(optimizer, d_model=cfg.d_model, warmup_steps=cfg.lr_warmup_steps)
-
-    # helpers
-    cur_noise = CurriculumNoiseScheduler(cfg)
-    metrics   = MetricsEngine(C.METRIC_TARGET_LENGTHS)
-    # Replace net.model_name() with a fixed string "gru_tc"
-    log_dir = U.create_model_dir(C.EXPERIMENT_DIR, int(time.time()), "gru_tc")
-    writer  = SummaryWriter(log_dir=log_dir)
-
-    best_val    = float("inf")
-    global_step = 0
-    net.train()
-
-    for epoch in range(cfg.n_epochs):
-        epoch_loss = collections.defaultdict(float)
-        nsmp       = 0
-
-        for batch in dl_train:
-            optimizer.zero_grad()
-            batch_gpu = batch.to_gpu()
-
-            # curriculum noise on seed (in-place)
-            with torch.no_grad():
-                noisy_seed = cur_noise.add_noise(batch_gpu.poses[:, :cfg.seed_seq_len])
-                batch_gpu.poses[:, :cfg.seed_seq_len] = noisy_seed
-            cur_noise.step()
-
-            # forward pass
-            from models import matrix_to_rot6d  # add near top of file
-
-            # 9-D → 6-D conversion
-            pose9 = batch_gpu.poses[:, :cfg.seed_seq_len]  # (B,120,J*9)
-            B, T, D = pose9.shape
-            J = D // 9
-            pose_mat = pose9.view(B, T, J, 3, 3)  # (B,120,J,3,3)
-            seed6d = matrix_to_rot6d(pose_mat.reshape(-1, 3, 3))  # (B*120*J,6)
-            seed6d = seed6d.view(B, T, J, 6)  # (B,120,J,6)
-
-            model_out = net(seed6d)
-
-
-            loss_dict = compute_loss(model_out, batch_gpu, cfg)
-            loss_dict["total_loss"].backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            net.training_step = global_step  # for scheduled sampling inside model
-
-            # logging --------------------------------------------------
-            for k, v in loss_dict.items():
-                epoch_loss[k] += v.item() * batch_gpu.batch_size
-            nsmp += batch_gpu.batch_size
-
-            if global_step % cfg.print_every == 0:
-                writer.add_scalar("loss/train", loss_dict["total_loss"].item(), global_step)
-                writer.add_scalar("lr", optimizer.param_groups[0]["lr"], global_step)
-
-            global_step += 1
-
-        # epoch-level logging ------------------------------------------
-        avg_loss = {k: v / nsmp for k, v in epoch_loss.items()}
-        print(f"[EPOCH {epoch+1:03d}] train total {avg_loss['total_loss']:.6f}")
-
-        # ------- validation ------------------------------------------
-        net.eval()
-        metrics.reset()
-        val_loss = collections.defaultdict(float)
-        vsamp    = 0
-        with torch.no_grad():
-            for batch in dl_valid:
-                batch_gpu = batch.to_gpu()
-                out = net(batch_gpu)
-                ldict = compute_loss(out, batch_gpu, cfg)
-                for k, v in ldict.items():
-                    val_loss[k] += v.item() * batch_gpu.batch_size
-                vsamp += batch_gpu.batch_size
-                metrics.compute_and_aggregate(out["predictions"], batch_gpu.poses[:, cfg.seed_seq_len:])
-
-        val_loss = {k: v / vsamp for k, v in val_loss.items()}
-        print(f"[EPOCH {epoch+1:03d}] valid total {val_loss['total_loss']:.6f}")
-        writer.add_scalar("loss/valid", val_loss["total_loss"], epoch)
-
-        # checkpoint ---------------------------------------------------
-        ckpt_path = os.path.join(log_dir, "model.pth")
-        if val_loss["total_loss"] < best_val:
-            best_val = val_loss["total_loss"]
-            torch.save({
-                "epoch":       epoch,
-                "model_state": net.state_dict(),
-                "opt_state":   optimizer.state_dict(),
-                "cfg":         vars(cfg)
-            }, ckpt_path)
-        net.train()
-
-    # ---------------------------------------------------------------
-    print("Training finished. Evaluating test set…")
-    evaluate_test(Path(log_dir).name.split("-")[0])
-
-# ----------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+#  Quick sanity check (executed only when run as a script)
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
-    main(Configuration.parse_cmd())
+    B, T, J = 2, 120, 22
+    seed = torch.randn(B, T, J, 6)
+    # Dummy config with necessary fields
+    class Cfg: pass
+    cfg = Cfg()
+    cfg.input_dim = J * 6
+    cfg.d_model = 256
+    cfg.n_head = 4
+    cfg.n_layer = 2
+    model = GRUTCMotionForecast(cfg)
+    out = model(seed, future=24)
+    print("Output shape:", out.shape)  # should be (2, 24, 22, 6)
