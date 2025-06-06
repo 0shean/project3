@@ -115,13 +115,23 @@ def compute_loss(pred6: torch.Tensor, batch, cfg):
 
 # ────────────────────────────────────────────────────────────────────
 
-def to_seed6d(pose9: torch.Tensor, cfg) -> torch.Tensor:
-    """pose9: (B, seed_len, J*9) → (B, seed_len, J, 6)"""
-    B, T, D = pose9.shape
+# ─── helper ─────────────────────────────────────────────────────────────
+def to_seed6d(seed9: torch.Tensor, cfg) -> torch.Tensor:
+    """
+    Convert a (B, T, J*9) batch of 3×3 rotation-matrices to 6-D rep
+    and reshape to (B, T, J, 6) for the model.
+    """
+    from models import matrix_to_rot6d                # keep import local
+    B, T, D = seed9.shape
     J = D // 9
-    mat = pose9.view(B, T, J, 3, 3)
-    seed6 = matrix_to_rot6d(mat.view(-1,3,3)).view(B, T, J, 6)
+
+    # (B,T,J*9) → (B,T,J,3,3)
+    mat = seed9.reshape(B, T, J, 3, 3)                # ←  use .reshape, not .view
+    # flatten to (B*T*J,3,3) so matrix_to_rot6d works
+    mat_flat = mat.reshape(-1, 3, 3)
+    seed6 = matrix_to_rot6d(mat_flat).reshape(B, T, J, 6)
     return seed6
+
 
 # ────────────────────────────────────────────────────────────────────
 
