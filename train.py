@@ -81,31 +81,51 @@ def build_dataloaders(cfg):
 # --------------------------------------------------------------------
 
 def compute_loss(model_out: Dict[str, torch.Tensor], batch, cfg):
-    pred6  = model_out["predictions"]                      # [B,T,J*6]
-    targ9  = batch.poses[:, cfg.seed_seq_len:]             # [B,T,J*9]
+    """Compute composite loss.
+    model_out["predictions"] : (B, T, J, 6)
+    batch.poses              : (B, seed+T, J*9)  – 9‑D rotation matrices
+    """
+    from models import rot6d_to_matrix, matrix_to_rot6d
 
-    B, T, D6 = pred6.shape
-    J = D6 // 6
+    # ------------------------------------------------------------------
+    # Predictions: 6‑D per joint → matrices + flattened 6‑D
+    pred6  = model_out["predictions"]                 # (B,T,J,6)
+    B, T, J, _ = pred6.shape
+    pred6_flat = pred6.reshape(B, T, J * 6)          # (B,T,J*6) for velocity‑loss
+    pred_mat   = rot6d_to_matrix(pred6.reshape(-1, 6)).view(B, T, J, 3, 3)
 
-    # convert predictions to matrices
-    pred_mat = rot6d_to_matrix(pred6.reshape(-1, 6)).view(B, T, J, 3, 3)
-    targ_mat = targ9.view(B, T, J, 3, 3)
+    # ------------------------------------------------------------------
+    # Targets: stored in LMDB as 9‑D (3×3) per joint
+    targ9  = batch.poses[:, cfg.seed_seq_len:]        # (B,T,J*9)
+    _, _, JD9 = targ9.shape
+    J_targ = JD9 // 9
+    targ_mat = targ9.view(B, T, J_targ, 3, 3)
+    target6_flat = matrix_to_rot6d(targ_mat.reshape(-1,3,3)).view(B, T, J_targ * 6)
 
+    assert J == J_targ, "Joint count mismatch between pred and target"
+
+    # ------------------------------------------------------------------
+    # Loss components
     loss_geo  = L.geodesic_loss(pred_mat, targ_mat)
-    loss_vel  = L.velocity_diff_loss(pred6, matrix_to_rot6d(targ_mat.reshape(-1,3,3)).view(B,T,J*6))
+    loss_vel  = L.velocity_diff_loss(pred6_flat, target6_flat)
     loss_bone = L.bone_length_loss(pred_mat, targ_mat)
-    loss_lim  = L.joint_limit_loss(pred_mat)
-    loss_ps   = model_out.get("ps_kld", torch.tensor(0.0, device=pred6.device))
+    loss_limit= L.joint_limit_loss(pred_mat)
 
-    total = (cfg.loss_geodesic * loss_geo + cfg.loss_vel * loss_vel +
-             cfg.loss_bone * loss_bone + cfg.loss_limit * loss_lim + cfg.loss_pskld * loss_ps)
+    # PS‑KLD (may be absent early in training)
+    loss_ps = model_out.get("ps_kld", torch.tensor(0.0, device=pred6.device))
+
+    total = (cfg.loss_geodesic * loss_geo +
+             cfg.loss_vel      * loss_vel +
+             cfg.loss_bone     * loss_bone +
+             cfg.loss_limit    * loss_limit +
+             cfg.loss_pskld    * loss_ps)
 
     return {
         "total_loss": total,
         "geodesic"  : loss_geo.detach(),
         "velocity"  : loss_vel.detach(),
         "bone"      : loss_bone.detach(),
-        "limit"     : loss_lim.detach(),
+        "limit"     : loss_limit.detach(),
         "pskld"     : loss_ps.detach()
     }
 
