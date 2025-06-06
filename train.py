@@ -187,14 +187,29 @@ def main(cfg: Configuration):
         with torch.no_grad():
             for batch in dl_valid:
                 b_gpu = batch.to_gpu()
+
+                # seed → 6-D and forward
                 seed6 = to_seed6d(b_gpu.poses[:, :cfg.seed_seq_len], cfg)
-                pred6 = net(seed6)
-                ldict = compute_loss(pred6,b_gpu,cfg)
-                for k,v in ldict.items(): vloss[k]+=v.item()*b_gpu.batch_size
-                vsamp+=b_gpu.batch_size
-                metrics.compute_and_aggregate(pred6.view(b_gpu.batch_size, cfg.target_seq_len, -1),
-                                               matrix_to_rot6d(b_gpu.poses[:, cfg.seed_seq_len:]).view(b_gpu.batch_size, cfg.target_seq_len, -1))
-        vtot=vloss['total_loss']/vsamp; print(f"[E{epoch+1:03d}] valid total {vtot:.4f}")
+                pred6 = net(seed6)  # (B,T,J,6)
+
+                # -------- losses --------
+                ldict = compute_loss(pred6, b_gpu, cfg)
+                for k, v in ldict.items():
+                    vloss[k] += v.item() * b_gpu.batch_size
+                vsamp += b_gpu.batch_size
+
+                # -------- metrics expect 9-D (J×9) flattened --------
+                B, T, J, _ = pred6.shape
+                pred9 = (
+                    rot6d_to_matrix(pred6.reshape(-1, 6))  # (B*T*J,3,3)
+                    .reshape(B, T, J * 9)  # (B,T,J*9)
+                )
+                target9 = b_gpu.poses[:, cfg.seed_seq_len:]  # (B,T,J*9)
+
+                metrics.compute_and_aggregate(pred9, target9)
+
+        vtot=vloss['total_loss']/vsamp
+        print(f"[E{epoch+1:03d}] valid total {vtot:.4f}")
         writer.add_scalar('valid/total', vtot, epoch)
         if vtot<best_val:
             best_val=vtot
