@@ -101,8 +101,10 @@ def compute_loss(pred6: torch.Tensor, batch, cfg):
 
     # ------------ losses -----------------------------------------------
     loss_geo  = L.geodesic_loss(pred_mat, targ_mat)
-    loss_vel  = L.velocity_diff_loss(pred6.reshape(B,T,J*6),
-                                     targ6.reshape(B,T,J*6))
+    loss_vel = L.velocity_diff_loss(
+        pred6.reshape(B, T, J * 6),
+        matrix_to_rot6d(targ_mat.reshape(-1, 3, 3)).reshape(B, T, J * 6)
+    )
     loss_bone  = L.bone_length_loss(pred_mat, targ_mat)
     loss_limit = L.joint_limit_loss(pred_mat)
     loss_ps    = torch.tensor(0.0, device=pred6.device)  # placeholder if unused
